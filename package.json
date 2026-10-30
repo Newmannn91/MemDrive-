@@ -21,6 +21,7 @@
     "README.md",
     "LICENSE"
   ],
+  "homepage": "https://github.com/Newmannn91/MemDrive-",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -32,6 +33,10 @@
   "license": "MIT",
   "main": "dist/index.js",
   "name": "memdrive-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Newmannn91/MemDrive-.git"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
