@@ -3,10 +3,46 @@
 All notable changes to MemDrive (`memdrive-mcp`) are documented here,
 newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The project
-is pre-1.0 and not yet published to npm; the versions below were
-delivered as zips and verified by the protocol suite (see
-TEST-REPORT.md). When the repository goes public, each section below
-maps to a GitHub Release.
+is pre-1.0 and was published to npm as of 0.5.2 (2026-10-30);
+earlier versions were delivered as zips and verified by the
+protocol suite (see TEST-REPORT.md). Each section below maps
+to a GitHub Release.
+
+## [0.6.0] - 2026-10-31
+
+### Added — UNVERIFIED on a real machine
+
+- Claude Code adapter for the setup wizard (fourth host: menu
+  item 4, `setup claude-code`). The wizard writes the
+  user-scope entry — top-level `mcpServers` in the one
+  `~/.claude.json` file (`%USERPROFILE%\.claude.json` on
+  Windows, or inside `CLAUDE_CONFIG_DIR` when that variable
+  is set) — with no `type` field (an entry without a `type`
+  is read as a stdio server) and a 10,000,000-byte response
+  budget in `env`. Local scope and project scope (`.mcp.json`)
+  are deliberately not written. A missing `~/.claude.json`
+  is never created: the wizard prints a ready-to-paste
+  snippet instead, because the file is Claude Code's own
+  main state file and creating a bare copy was never
+  verified (B方案, user decision 2026-10-31).
+- The adapter, the path rule, and the entry shape are taken
+  from Anthropic's official docs only (checked 2026-10-31);
+  no real-machine test was run, by the user's explicit
+  decision. The 10,000,000 budget is an ESTIMATE, not a
+  measurement (paid-product reasoning: a limit as stingy as
+  Claude Desktop's would make no sense for paying users).
+  If bundled reads fail or truncate in Claude Code, user
+  reports are the feedback path for correcting the default.
+  Claude Code's own output limits (default 25,000 tokens
+  per tool result) apply on top of this server-side budget;
+  see the README budget table.
+
+### Changed
+
+- Version 0.5.2 → 0.6.0 in `package.json` and `src/index.ts`
+  `VERSION` only. No changes to the tools, sandbox, default
+  budget (950,000), preview ladder, other adapters,
+  dependencies, or tool descriptions.
 
 ## [0.5.2] - 2026-10-30
 

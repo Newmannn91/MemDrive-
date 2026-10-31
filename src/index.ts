@@ -21,13 +21,13 @@ import { LocalStorageBackend } from './storage.js';
 import { registerTools } from './tools.js';
 import { runSetupWizard } from './wizard.js';
 
-const VERSION = '0.5.2';
+const VERSION = '0.6.0';
 
 async function main(): Promise<void> {
   // `node dist/index.js setup` runs the interactive setup wizard
   // instead of the MCP server. Without a host argument the wizard
   // asks which host to configure; `setup cursor` / `setup claude`
-  // / `setup vscode` skips that question. No-arg invocation still starts the
+  // / `setup vscode` / `setup claude-code` skips that question. No-arg invocation still starts the
   // server; the wizard writes to stdout freely because no protocol
   // traffic is running in this mode.
   if (process.argv[2] === 'setup') {

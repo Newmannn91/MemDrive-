@@ -1,15 +1,20 @@
 /**
  * Host configuration writing, behind a small adapter per host.
  *
- * Wizard targets Claude Desktop, Cursor, and VS Code for automatic
- * config writes. Adding another host later means adding one adapter
+ * Wizard targets Claude Desktop, Cursor, VS Code, and Claude Code
+ * for automatic config writes. Adding another host later means adding one adapter
  * object (how to find that host's config files, and under which key
  * the server entry lives) — the backup / parse / merge / write logic
  * below is shared and host-independent. Other hosts are deliberately
  * NOT added here until each one's config surface is verified on a
  * real machine: Codex and Gemini are CLIs with no desktop config
  * file, Grok has no desktop MCP config surface, and no Muse
- * desktop app exists.
+ * desktop app exists. EXCEPTION: Claude Code (0.6.0) was added
+ * on the basis of Anthropic's official docs only (checked
+ * 2026-10-31, code.claude.com), with NO real-machine test; its
+ * budget is an estimate, not a measurement (see below), and
+ * that status is stated in the README, CHANGELOG, and
+ * TEST-REPORT. Never present Claude Code support as verified.
  *
  * Safety rules, for every host:
  *   - Only files that already exist are ever written, with ONE
@@ -17,7 +22,12 @@
  *     created when missing AND the host's config directory already
  *     exists (evidence the host is installed; each host itself
  *     creates the file when a server is added from its UI). A
- *     missing Claude config file is reported, never created.
+ *     missing Claude Desktop or Claude Code config file is
+ *     reported, never created: `~/.claude.json` is Claude Code's
+ *     own main state file, not a dedicated MCP file, and
+ *     creating a bare copy was never verified on a real machine
+ *     (B方案, user decision 2026-10-31; the wizard prints the
+ *     ready-to-paste snippet instead).
  *   - A backup is written BEFORE any change to an existing file:
  *     `<file>.bak` when no backup exists yet, otherwise
  *     `<file>.bak-<timestamp>`, so an earlier backup is never
@@ -54,6 +64,16 @@
  *     distinct 10.44 MB PNG copies, ~8.96 MB binary /
  *     ~11.95 MB base64 from two-decimal previews, ~2 MB
  *     headroom; exact ceiling unmeasured, ladder closed).
+ *     Claude Code gets 10,000,000 — ESTIMATED, UNVERIFIED
+ *     (user decision 2026-10-31, no real-machine test: Code is
+ *     a paid product, so its limit cannot reasonably be as
+ *     stingy as Desktop's; if the estimate is wrong, user
+ *     reports will drive a patch). Claude Code also applies
+ *     its OWN output limits on top of this server-side budget
+ *     (default 25,000 tokens per tool result; long text
+ *     results are spilled to a file), so this value controls
+ *     only how much the server sends, not how much the model
+ *     sees inline; see the README budget table.
  */
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -247,11 +267,49 @@ export const vscodeAdapter = {
         return [pathMod.join(configDir, 'mcp-config.json')];
     },
 };
+/**
+ * Claude Code, user scope: the top-level `mcpServers` key of the
+ * ONE `~/.claude.json` file (Windows:
+ * `%USERPROFILE%\.claude.json`). Local scope (per-project entry
+ * inside the same file) and project scope (`.mcp.json` in a
+ * project root) are deliberately NOT probed: the wizard writes
+ * the user-global config only, matching the Cursor/VS Code
+ * global-only rule. When `CLAUDE_CONFIG_DIR` is set and
+ * non-empty, the file lives inside that directory instead, per
+ * the official docs. The file is returned ONLY when it already
+ * exists (B方案): a missing file is reported and never created,
+ * because `~/.claude.json` is Claude Code's own main state file
+ * and creating a bare copy was never verified. The entry carries
+ * NO `type` field: an entry without a `type` is read as a stdio
+ * server, the same shape as the Claude Desktop entry.
+ * Budget 10,000,000 is ESTIMATED, UNVERIFIED (user decision
+ * 2026-10-31; see the file header). Verified only against
+ * Anthropic's official docs (2026-10-31), never on a real
+ * machine.
+ */
+export const claudeCodeAdapter = {
+    id: 'claude-code',
+    displayName: 'Claude Code',
+    serversKey: 'mcpServers',
+    serverKey: 'memdrive',
+    responseBudgetBytes: 10_000_000,
+    findConfigPaths: async (deps) => {
+        const env = probeEnv(deps);
+        const home = probeHome(deps);
+        const pathMod = pathModuleFor(probePlatform(deps));
+        const override = env['CLAUDE_CONFIG_DIR']?.trim();
+        const configPath = override
+            ? pathMod.join(pathMod.resolve(home, override), '.claude.json')
+            : pathMod.join(home, '.claude.json');
+        return (await probeExists(deps, configPath)) ? [configPath] : [];
+    },
+};
 /** All host adapters, in wizard menu order: Claude Desktop first. */
 export const HOST_ADAPTERS = [
     claudeDesktopAdapter,
     cursorAdapter,
     vscodeAdapter,
+    claudeCodeAdapter,
 ];
 /**
  * Parse the optional host argument after `setup`
@@ -261,7 +319,9 @@ export const HOST_ADAPTERS = [
  * Matching is case-insensitive after trimming; `claude-desktop`
  * is accepted as an alias for `claude`. Only the single word
  * `vscode` selects VS Code: `vs-code` and `code` are NOT aliases
- * and fall back to the prompt, never guessed.
+ * and fall back to the prompt, never guessed. Only
+ * `claude-code` selects Claude Code: `code` is NOT an alias for
+ * it either.
  */
 export function parseHostArgument(input) {
     if (input === undefined) {
@@ -273,6 +333,9 @@ export function parseHostArgument(input) {
     }
     if (word === 'claude' || word === 'claude-desktop') {
         return 'claude-desktop';
+    }
+    if (word === 'claude-code') {
+        return 'claude-code';
     }
     if (word === 'cursor') {
         return 'cursor';
@@ -289,6 +352,9 @@ export function hostAdapterForId(id) {
     }
     if (id === 'vscode') {
         return vscodeAdapter;
+    }
+    if (id === 'claude-code') {
+        return claudeCodeAdapter;
     }
     return claudeDesktopAdapter;
 }

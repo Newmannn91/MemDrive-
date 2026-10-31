@@ -1010,3 +1010,70 @@ then assets; each must appear as a visible new window),
 in one host and then the other two. A failure on any step
 is a failure of the 0.5.2 launch, to be diagnosed from what
 his eyes saw, not from tool text.
+
+## §17 — 0.6.0 Claude Code adapter (2026-10-31)
+
+0.6.0 adds ONE feature: a Claude Code adapter for the setup
+wizard (fourth host, menu item 4, `setup claude-code`). No
+changes to the tools, sandbox, default budget, preview ladder,
+other adapters, dependencies, or tool descriptions. Version
+0.5.2 → 0.6.0 in `package.json` and `src/index.ts` `VERSION`
+only.
+
+What was verified, and what was NOT, stated plainly:
+
+- The config surface was verified against Anthropic's official
+  docs only (code.claude.com, checked 2026-10-31): three MCP
+  scopes across two files; the wizard writes the USER scope —
+  the top-level `mcpServers` key of the one `~/.claude.json`
+  file (`%USERPROFILE%\.claude.json` on Windows, or inside
+  `CLAUDE_CONFIG_DIR` when that variable is set). Local scope
+  (per-project entries in the same file) and project scope
+  (`.mcp.json`) are deliberately not written. An entry with
+  no `type` field is read as a stdio server, so the entry
+  shape matches Claude Desktop's (no `type`), with the
+  10,000,000-byte budget in `env`.
+- The budget (10,000,000) is ESTIMATED and UNVERIFIED: the
+  author's decision (2026-10-31), on paid-product reasoning,
+  with NO real-machine test. No bundled read, no
+  `claude mcp list` check, and no wizard run in Claude Code
+  was ever performed for this host. If a bundled read fails
+  or truncates in Claude Code, the exact error is the
+  feedback that corrects the default. Claude Code's own
+  output limits (default 25,000 tokens per tool result, long
+  text spilled to a file) apply on top of this server-side
+  budget; see the README budget table.
+- A missing `~/.claude.json` is NEVER created (B方案, user
+  decision 2026-10-31): the wizard prints the ready-to-paste
+  snippet instead, because the file is Claude Code's own
+  main state file and creating a bare copy was never
+  verified. The merge preserves every other top-level key
+  (including per-project entries), with backup-before-write
+  and corrupt-JSON abort from the shared code, unchanged.
+
+VM verification (2026-10-31, Node v24.22.1):
+
+- `npm run typecheck` clean; `npm run build` clean.
+- `npm test` **80/80** (75 existing + 5 new Claude Code
+  checks: `claude-code` argument parsing and adapter order,
+  entry shape with no `type` and the 10,000,000 budget env,
+  path resolution incl. `CLAUDE_CONFIG_DIR` override/empty/
+  relative forms and the existing-file-only rule, merge
+  preserving project records, and the never-create-missing
+  write path with backup on merge). No VM test launches
+  Claude Code or writes a real user config.
+- Clean-extraction re-verification: the draft zip was
+  extracted to a fresh directory (no `node_modules` before
+  install), `npm install` + typecheck + build + test run
+  there — 80/80, `setup.bat` CRLF intact (71 CRLF),
+  extracted `package.json` version 0.6.0. Verified twice
+  (draft + final zip, same suite, no failures).
+
+Still NOT tested: everything that needs a real Claude Code
+installation — the wizard run itself, `claude mcp list` /
+`/mcp` showing the server connected, a bundled text+image
+read, the snippet path when the file is missing, and the
+`CLAUDE_CONFIG_DIR` override on a real machine. A failure
+on any of these is a failure of the 0.6.0 adapter, to be
+diagnosed from the exact error and the exact file contents
+reported by the user, not from guesses.

@@ -23,6 +23,7 @@ import { Jimp } from 'jimp';
 import { resolveResponseBudgetBytes } from '../dist/config.js';
 import {
   backupPathFor,
+  claudeCodeAdapter,
   claudeDesktopAdapter,
   cursorAdapter,
   HOST_ADAPTERS,
@@ -1030,11 +1031,12 @@ async function main() {
       assert.equal(parseHostArgument('unknown-host'), null);
       assert.deepEqual(
         HOST_ADAPTERS.map((a) => a.id),
-        ['claude-desktop', 'cursor', 'vscode'],
+        ['claude-desktop', 'cursor', 'vscode', 'claude-code'],
       );
       assert.equal(hostAdapterForId('cursor'), cursorAdapter);
       assert.equal(hostAdapterForId('claude-desktop'), claudeDesktopAdapter);
       assert.equal(hostAdapterForId('vscode'), vscodeAdapter);
+      assert.equal(hostAdapterForId('claude-code'), claudeCodeAdapter);
     });
 
     await check('parseHostArgument (VS Code): only the single word vscode selects it; vs-code/code fall back to prompt', async () => {
@@ -1331,6 +1333,141 @@ async function main() {
           dir === claudeDataDir ? ['claude_pzs8sxrjxfjjc'] : [],
       });
       assert.deepEqual(found, [appDataConfig, globConfig]);
+    });
+
+    await check('parseHostArgument (Claude Code): only claude-code selects it; claude stays Desktop, code falls back to prompt', async () => {
+      assert.equal(parseHostArgument('claude-code'), 'claude-code');
+      assert.equal(parseHostArgument('Claude-Code'), 'claude-code');
+      assert.equal(parseHostArgument('CLAUDE-CODE'), 'claude-code');
+      assert.equal(parseHostArgument('  claude-code  '), 'claude-code');
+      assert.equal(parseHostArgument('claudecode'), null);
+      assert.equal(parseHostArgument('claude_code'), null);
+      assert.equal(parseHostArgument('claude'), 'claude-desktop');
+      assert.equal(parseHostArgument('code'), null);
+      assert.equal(hostAdapterForId('claude-code'), claudeCodeAdapter);
+    });
+
+    await check('buildServerEntry (Claude Code): no type field, 10000000 budget env; configSnippet matches host', async () => {
+      const entry = buildServerEntry('/tmp/fakehome/memdrive', claudeCodeAdapter);
+      assert.equal('type' in entry, false);
+      assert.equal(entry.command, 'node');
+      assert.equal(entry.env.MEMDRIVE_ROOT, '/tmp/fakehome/memdrive');
+      assert.equal(entry.env.MEMDRIVE_RESPONSE_BUDGET_BYTES, '10000000');
+      const snippet = JSON.parse(configSnippet('/tmp/fakehome/memdrive', claudeCodeAdapter));
+      assert.deepEqual(snippet.mcpServers.memdrive, entry);
+      assert.equal(claudeCodeAdapter.createIfMissing, undefined);
+    });
+
+    await check('findConfigPaths (Claude Code, fakes): single .claude.json, existing only; CLAUDE_CONFIG_DIR override wins', async () => {
+      // Default: file exists -> returned; file missing -> [] even when
+      // the ~/.claude directory exists (B方案: never created).
+      const found = await claudeCodeAdapter.findConfigPaths({
+        platform: 'darwin',
+        homeDir: '/Users/you',
+        exists: async (p) => p === '/Users/you/.claude.json',
+      });
+      assert.deepEqual(found, ['/Users/you/.claude.json']);
+      const missing = await claudeCodeAdapter.findConfigPaths({
+        platform: 'darwin',
+        homeDir: '/Users/you',
+        exists: async (p) => p === '/Users/you/.claude',
+      });
+      assert.deepEqual(missing, []);
+      const winFound = await claudeCodeAdapter.findConfigPaths({
+        platform: 'win32',
+        homeDir: 'C:\\Users\\x',
+        exists: async (p) => p === 'C:\\Users\\x\\.claude.json',
+      });
+      assert.deepEqual(winFound, ['C:\\Users\\x\\.claude.json']);
+      // CLAUDE_CONFIG_DIR override: file inside that directory only;
+      // the default path is ignored when the override is set.
+      const overridden = await claudeCodeAdapter.findConfigPaths({
+        platform: 'linux',
+        homeDir: '/home/u',
+        env: { CLAUDE_CONFIG_DIR: '/custom/claude' },
+        exists: async (p) => p === '/custom/claude/.claude.json',
+      });
+      assert.deepEqual(overridden, ['/custom/claude/.claude.json']);
+      const overriddenDefault = await claudeCodeAdapter.findConfigPaths({
+        platform: 'linux',
+        homeDir: '/home/u',
+        env: { CLAUDE_CONFIG_DIR: '/custom/claude' },
+        exists: async (p) => p === '/home/u/.claude.json',
+      });
+      assert.deepEqual(overriddenDefault, []);
+      const winOverride = await claudeCodeAdapter.findConfigPaths({
+        platform: 'win32',
+        homeDir: 'C:\\Users\\x',
+        env: { CLAUDE_CONFIG_DIR: 'D:\\custom\\claude' },
+        exists: async (p) => p === 'D:\\custom\\claude\\.claude.json',
+      });
+      assert.deepEqual(winOverride, ['D:\\custom\\claude\\.claude.json']);
+      // Empty override falls back to the default path; a relative
+      // override resolves against the home directory.
+      const emptyOverride = await claudeCodeAdapter.findConfigPaths({
+        platform: 'linux',
+        homeDir: '/home/u',
+        env: { CLAUDE_CONFIG_DIR: '   ' },
+        exists: async (p) => p === '/home/u/.claude.json',
+      });
+      assert.deepEqual(emptyOverride, ['/home/u/.claude.json']);
+      const relativeOverride = await claudeCodeAdapter.findConfigPaths({
+        platform: 'linux',
+        homeDir: '/home/u',
+        env: { CLAUDE_CONFIG_DIR: 'rel/claude' },
+        exists: async (p) => p === '/home/u/rel/claude/.claude.json',
+      });
+      assert.deepEqual(relativeOverride, ['/home/u/rel/claude/.claude.json']);
+    });
+
+    await check('mergeConfigJson (Claude Code): preserves projects and other top-level keys, installs memdrive only', async () => {
+      const entry = buildServerEntry('/r', claudeCodeAdapter);
+      const fixture = {
+        projects: {
+          '/p': { mcpServers: { other: { command: 'x', args: [] } }, history: [] },
+        },
+        otherKey: 1,
+        mcpServers: { other: { command: 'y', args: [] } },
+      };
+      const merged = mergeConfigJson(JSON.stringify(fixture), claudeCodeAdapter, entry);
+      assert.equal(merged.ok, true);
+      const doc = JSON.parse(merged.text);
+      assert.deepEqual(doc.projects, fixture.projects);
+      assert.equal(doc.otherKey, 1);
+      assert.deepEqual(doc.mcpServers.other, { command: 'y', args: [] });
+      assert.deepEqual(doc.mcpServers.memdrive, entry);
+      assert.equal('type' in doc.mcpServers.memdrive, false);
+    });
+
+    await check('writeHostConfig (Claude Code): missing file is NEVER created; existing file merges with backup', async () => {
+      const dir = path.join(scratch, 'codecCfg');
+      await fs.mkdir(dir, { recursive: true });
+      const configPath = path.join(dir, '.claude.json');
+      const entry = buildServerEntry('/r', claudeCodeAdapter);
+      const missing = await writeHostConfig(claudeCodeAdapter, configPath, entry);
+      assert.equal(missing.status, 'missing');
+      await assert.rejects(fs.stat(configPath));
+      // Existing file: merge preserves other keys, backs up first.
+      const original = JSON.stringify(
+        { projects: { '/p': { history: [] } }, mcpServers: { other: { command: 'x', args: [] } } },
+        null,
+        2,
+      );
+      await fs.writeFile(configPath, original);
+      const written = await writeHostConfig(claudeCodeAdapter, configPath, entry);
+      assert.equal(written.status, 'written');
+      assert.equal(await fs.readFile(written.backupPath, 'utf8'), original);
+      const doc = JSON.parse(await fs.readFile(configPath, 'utf8'));
+      assert.deepEqual(doc.projects, { '/p': { history: [] } });
+      assert.deepEqual(doc.mcpServers.other, { command: 'x', args: [] });
+      assert.equal(doc.mcpServers.memdrive.env.MEMDRIVE_RESPONSE_BUDGET_BYTES, '10000000');
+      // Corrupt file: untouched, no backup.
+      const corruptPath = path.join(dir, 'corrupt.json');
+      await fs.writeFile(corruptPath, '{broken');
+      const corrupt = await writeHostConfig(claudeCodeAdapter, corruptPath, entry);
+      assert.equal(corrupt.status, 'corrupt');
+      assert.equal(await fs.readFile(corruptPath, 'utf8'), '{broken');
+      await assert.rejects(fs.stat(`${corruptPath}.bak`));
     });
 
     await check('findConfigPaths (macOS fake): single Application Support path', async () => {

@@ -11,18 +11,20 @@
  * primary lookup (ordinary machines lack the value; it is an
  * enterprise-only fallback that is not implemented here).
  *
- * Flow: choose a host (Claude Desktop, Cursor, or VS Code) →
- * probe for existing sync folders (OneDrive / Google Drive /
+ * Flow: choose a host (Claude Desktop, Cursor, VS Code, or Claude
+ * Code) → probe for existing sync folders (OneDrive / Google Drive /
  * iCloud) plus the `~/memdrive` default → numbered menu, or a
  * custom path → `mkdir -p` the chosen root → find the chosen
  * host's config (see host-config.ts) → back it up, merge the
  * server entry (or create the file for Cursor / VS Code when its
  * config directory exists), and print the restart instruction.
  * The entry carries the host's response budget in its `env` when
- * the adapter defines one (Cursor, VS Code); Claude Desktop
- * entries carry no budget env. When no config file is found, the
- * wizard writes nothing and prints a ready-to-paste JSON snippet
- * instead.
+ * the adapter defines one (Cursor, VS Code, Claude Code — the
+ * Claude Code budget is an unverified estimate, see
+ * host-config.ts); Claude Desktop entries carry no budget env.
+ * When no config file is found, the wizard writes nothing and prints
+ * a ready-to-paste JSON snippet instead. A missing Claude Code
+ * file is never created (see host-config.ts).
  *
  * The pure/testable parts (candidate probing with injectable
  * environment and filesystem, custom-path validation, server-entry
@@ -280,7 +282,8 @@ export function serverScriptPath(): string {
 /**
  * Build the host-config server entry for a chosen library root.
  * The entry carries the adapter's per-host response budget in its
- * `env` only when the adapter defines one (Cursor, VS Code);
+ * `env` only when the adapter defines one (Cursor, VS Code,
+ * Claude Code — Claude Code's is an unverified estimate);
  * Claude Desktop entries carry no budget env and keep the server
  * default. `configSnippet` uses this function, so snippets carry
  * the same budget env.

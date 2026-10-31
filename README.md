@@ -13,7 +13,7 @@ through six small tools. No cloud service, no account, no server to run —
 the MCP server runs on your own machine and touches only the folder you
 point it at.
 
-> **Status: MVP 0.5.0.** Local filesystem backend only. WebDAV is
+> **Status: MVP 0.6.0.** Local filesystem backend only. WebDAV is
 > interface-reserved behind the `StorageBackend` interface but not
 > implemented. Whether it is implemented later depends on user
 > feedback, and it will only be considered if the user base is large
@@ -41,7 +41,12 @@ point it at.
 > 10,000,000 on the 2026-10-30 verified read and adds
 > `open_containing_folder` (open a note's folder in the OS file
 > manager, only when the user explicitly asks, no highlight or
-> selection — see TEST-REPORT.md §14).
+> selection — see TEST-REPORT.md §14). 0.6.0 adds a Claude Code
+> adapter to the wizard (user scope, `~/.claude.json` top-level
+> `mcpServers`, budget 10,000,000) — **UNVERIFIED on a real
+> machine, budget estimated by the author's decision, not
+> measured**; see [Claude Code config](#claude-code-config) and
+> TEST-REPORT.md §17.
 
 ## Quick start
 
@@ -51,7 +56,7 @@ Requires Node.js 18+.
 the release zip, extract it, and run the launcher for your system
 (it installs dependencies, builds, and starts the wizard, which
 asks which host to configure and which folder to use, and writes
-the Claude Desktop, Cursor, or VS Code config):
+the Claude Desktop, Cursor, VS Code, or Claude Code config):
 
 - Windows: double-click `setup.bat`
 - macOS: double-click `setup.command` (or run `./setup.sh` in a terminal)
@@ -194,6 +199,61 @@ image read have been verified in VS Code on a real machine so far;
 the other tools still need a real-machine check (see
 [Roadmap](#roadmap-not-in-this-mvp)).
 
+## Claude Code config
+
+> **UNVERIFIED — read this first.** The Claude Code adapter was
+> added from Anthropic's official docs only (checked 2026-10-31)
+> and has **never been tested on a real machine**, in any host.
+> The 10,000,000-byte budget below is an estimate set by the
+> author's decision (Claude Code is a paid product; a limit as
+> stingy as Claude Desktop's would make no sense for paying
+> users), not a measurement. If a bundled read fails or comes
+> back truncated in Claude Code, please report the exact error —
+> that report is how the default gets corrected.
+
+The setup wizard (see [Setup](#setup-wizard--launchers)) writes
+this for you, in Claude Code's **user scope**: the top-level
+`mcpServers` key of the one `~/.claude.json` file
+(`%USERPROFILE%\.claude.json` on Windows,
+`~/.claude.json` on macOS/Linux). When `CLAUDE_CONFIG_DIR` is
+set, the file lives inside that directory instead. Local scope
+(per-project entries inside the same file) and project scope
+(`.mcp.json` in a project root) are not written: the wizard
+writes the user-global config only, so the server is available
+in every project. If `~/.claude.json` does not exist, the wizard
+writes nothing and prints a ready-to-paste snippet instead — it
+never creates the file, because `~/.claude.json` is Claude
+Code's own main state file (it also holds project records),
+not a dedicated MCP file, and creating a bare copy was never
+verified.
+
+```json
+{
+  "mcpServers": {
+    "memdrive": {
+      "command": "node",
+      "args": ["/absolute/path/to/memdrive-mcp/dist/index.js"],
+      "env": {
+        "MEMDRIVE_ROOT": "/absolute/path/to/your/library",
+        "MEMDRIVE_RESPONSE_BUDGET_BYTES": "10000000"
+      }
+    }
+  }
+}
+```
+
+The entry carries no `type` field: Claude Code reads an entry
+without a `type` as a stdio server, the same shape as a Claude
+Desktop entry. The budget above controls only how much this
+server sends. Claude Code applies its own output limits on top
+(default 25,000 tokens per tool result; long text results are
+spilled to a file for the model to read back), so a large
+bundled read may arrive as a file reference rather than inline
+content. To raise Claude Code's own limit, set
+`MAX_MCP_OUTPUT_TOKENS` in the shell before starting Claude
+Code (for example `MAX_MCP_OUTPUT_TOKENS=50000 claude`). Check
+the connection with `claude mcp list` or the `/mcp` panel.
+
 Optional: raise (or lower) the `read_file` total response budget if your
 client allows larger tool results than Claude Desktop's ~1 MB ceiling:
 
@@ -217,10 +277,13 @@ published, use the zip + launcher form below.
 What the wizard does, in order:
 
 0. **Chooses a host.** The wizard asks which host to configure —
-   1 Claude Desktop, 2 Cursor, 3 VS Code (Enter = 1). You can skip
+   1 Claude Desktop, 2 Cursor, 3 VS Code, 4 Claude Code
+   (Enter = 1). You can skip
    the question with an argument: `node dist/index.js setup cursor`
    (or `setup claude` / `setup claude-desktop`, `setup vscode` —
-   only that one word, no `vs-code` / `code` alias). The argument
+   only that one word, no `vs-code` / `code` alias,
+   `setup claude-code` — only that spelling, `code` is not an
+   alias). The argument
    is an optional shortcut for people who already know which host
    they want; the prompt is the default, foolproof path, including
    for `npx memdrive-mcp setup` and the launchers, which call the
@@ -244,7 +307,12 @@ What the wizard does, in order:
    `.cursor` directory exists. VS Code: the Copilot Global config
    file only, `%USERPROFILE%\.copilot\mcp-config.json` on Windows
    and `~/.copilot/mcp-config.json` on macOS/Linux, returned only
-   when the `.copilot` directory exists. Exactly one file → it is
+   when the `.copilot` directory exists. Claude Code: the user
+   scope only, the top-level `mcpServers` key of the one
+   `~/.claude.json` file (`%USERPROFILE%\.claude.json` on
+   Windows, `~/.claude.json` on macOS/Linux, or inside
+   `CLAUDE_CONFIG_DIR` when that variable is set), returned
+   only when the file already exists. Exactly one file → it is
    used; several → you pick one; none → nothing is written and the
    wizard prints a ready-to-paste snippet instead.
 3. **Writes the config safely.** An existing file is backed up
@@ -253,13 +321,16 @@ What the wizard does, in order:
    `mcpServers.memdrive` entry (`command: node`, `args: [<absolute
    path to dist/index.js>]`, `env: {MEMDRIVE_ROOT: <chosen folder>}`,
    plus `type: "stdio"` for Cursor and VS Code, plus the host's
-   response budget in `env` for Cursor and VS Code — see
+   response budget in `env` for Cursor, VS Code, and Claude Code
+   — see
    [Limits](#limits-all-in-srcconfigts-nowhere-else); Claude Desktop
-   entries carry no budget env) is merged in; every other key and
+   entries carry no budget env, and Claude Code entries carry no
+   `type` field) is merged in; every other key and
    every other server is preserved, and an existing entry's
    `"tools": ["*"]` field (VS Code) is carried over. For Cursor and
    VS Code, a missing config file is created instead (the host
-   directory already exists), with no backup to take. A corrupt
+   directory already exists), with no backup to take. A missing
+   Claude Desktop or Claude Code file is never created. A corrupt
    config file aborts the write entirely — nothing is backed up,
    nothing is changed. Then it tells you to fully quit and restart
    the host you configured.
@@ -278,14 +349,18 @@ Notepad and read it before running if you like. To proceed, click
 **More info**, then **Run anyway**. No code signing is used (a paid
 certificate is only worth it once the project earns revenue).
 
-**Other hosts.** The wizard writes Claude Desktop, Cursor, and
-VS Code config (global config for Cursor, Copilot Global config
-for VS Code). The config-writing code is isolated behind a small
+**Other hosts.** The wizard writes Claude Desktop, Cursor,
+VS Code, and Claude Code config (global config for Cursor,
+Copilot Global config for VS Code, user scope for Claude Code).
+The config-writing code is isolated behind a small
 per-host adapter so another host can be added later, but only
 after that host's config surface is verified on a real machine —
+with one exception: Claude Code was added from Anthropic's
+official docs only and is unverified (see
+[Claude Code config](#claude-code-config)).
 Codex/Gemini are CLIs with no desktop config file, Grok has no
 desktop MCP config surface, and no Muse desktop app exists. New
-hosts are added only on user feedback after these three.
+hosts are added only on user feedback after these four.
 
 ## Tools
 
@@ -411,7 +486,7 @@ confirmation happens in the conversation.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `RESPONSE_BUDGET_DEFAULT_BYTES` | 950,000 | Default total budget for one `read_file` response: UTF-8 bytes of the text block plus base64 bytes of every image block, counted together. Overridable with `MEMDRIVE_RESPONSE_BUDGET_BYTES`, clamped to 100,000–50,000,000 (`RESPONSE_BUDGET_MIN/MAX_BYTES`). The wizard writes a per-host override into Cursor's and VS Code's config entries (see the per-host table below); Claude Desktop and unknown hosts keep this default. |
+| `RESPONSE_BUDGET_DEFAULT_BYTES` | 950,000 | Default total budget for one `read_file` response: UTF-8 bytes of the text block plus base64 bytes of every image block, counted together. Overridable with `MEMDRIVE_RESPONSE_BUDGET_BYTES`, clamped to 100,000–50,000,000 (`RESPONSE_BUDGET_MIN/MAX_BYTES`). The wizard writes a per-host override into Cursor's, VS Code's, and Claude Code's config entries (see the per-host table below); Claude Desktop and unknown hosts keep this default. |
 | `TEXT_MAX_BYTES` | 1,000,000 | Text returned by `read_file` is truncated here (with a note) — and also at the total budget, whichever is smaller. Text is guaranteed first; images get only the remainder. |
 | `IMAGE_PREVIEW_MAX_BYTES` | 3,500,000 | Per-image preview ceiling (binary bytes). Image previews are downscaled in memory below this *and* below what the remaining response budget allows, whichever is smaller. The preview ladder tries a full-resolution JPEG re-encode first, trying JPEG qualities 95, 90, then 80 before shrinking, then shrinks in 0.9 steps at quality 80, returning the first attempt that fits — so the preview stays close to the largest size the budget allows instead of stopping at a coarse first shrink, and spends headroom on sharpness when full resolution already fits. The on-disk original is never modified. |
 
@@ -443,6 +518,7 @@ verified, and neither exact ceiling was measured.
 | Claude Desktop | 950,000 | Verified: 2026-10-28 single-variable experiment — with the budget disabled via the environment variable, the same bundled read failed twice with the exact 1,048,576 error; 950,000 leaves ~98 KB of headroom for JSON framing and notes. |
 | Cursor | 10,000,000 | Verified: 2026-10-30 single bundled read passed (`notes/测试A.md`, four distinct image references, `include_images` default true, test budget 50,000,000, 26 seconds, no host size error); each preview reported as 2.24 MB downscaled in memory, original untouched, totalling ~8.96 MB binary / ~11.95 MB base64; ~2 MB of headroom is left; the exact ceiling was not measured and the ladder is closed. The test line was then restored to 10,000,000 and a normal read re-verified. |
 | VS Code | 10,000,000 | Partly verified: 2026-10-29 four-image bundled read passed (`notes/测试A.md`, four distinct copies of a 10.44 MB PNG); each preview reported as 2.24 MB to two decimals, totalling ~8.96 MB binary / ~11.95 MB base64; ~2 MB of headroom is left; the exact ceiling was not measured and the ladder is closed — no further probing. |
+| Claude Code | 10,000,000 | **ESTIMATED, UNVERIFIED.** Set by the author's decision 2026-10-31, never tested on a real machine: Claude Code is a paid product, so a limit as stingy as Claude Desktop's would make no sense for paying users; if the estimate is wrong, user reports of oversized-result errors are the feedback path. Claude Code also applies its own output limits on top of this server-side budget (default 25,000 tokens per tool result; long text results spilled to a file), so this value controls only how much the server sends. Raise Claude Code's own limit with `MAX_MCP_OUTPUT_TOKENS` before starting it. |
 
 ChatGPT, Grok, and other hosts are untested for the limit; the
 950,000 default is treated as universal for unknown hosts rather

@@ -30,7 +30,9 @@ export const TEXT_MAX_BYTES = 1_000_000;
  * setup wizard writes the measured budget into each host's own
  * config entry (see `responseBudgetBytes` in `host-config.ts`):
  * Claude Desktop writes no budget env and keeps this 950,000
- * default; Cursor writes 10,000,000; VS Code writes 10,000,000.
+ * default; Cursor writes 10,000,000; VS Code writes 10,000,000;
+ * Claude Code writes 10,000,000 (ESTIMATED, UNVERIFIED — user
+ * decision 2026-10-31, no real-machine test).
  * Cursor is verified (2026-10-30, see `host-config.ts` for the
  * evidence) and VS Code is partly verified; neither exact ceiling
  * was measured. Unknown hosts keep this default.
