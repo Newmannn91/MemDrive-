@@ -100,10 +100,10 @@ source (2026-11-06). Not yet published.
   callback forms). Literal IPv4 and bracketed IPv6 hosts are validated
   before connecting.
 - Magic-byte fallback in `read_file`, bundled Markdown reads,
-  `open_image`, and `copyLocalImage` is restricted to extensionless
-  files (`ext === ''`), and BMP/GIF magic-byte checks are tightened
-  so text notes starting with `"BM"` or `"GIF8"` are never
-  misidentified as images.
+  `open_image`, and `copyLocalImage`
+  is restricted to extensionless files (`ext === ''`), and BMP/GIF
+  magic-byte checks are tightened so text notes starting with `"BM"`
+  or `"GIF8"` are never misidentified as images.
 - `encodeImageSrc` preserves non-whitespace CJK characters for readable
   Markdown links while percent-encoding ASCII and non-ASCII whitespace
   (such as `\u3000`), BOM, control characters, and `#`, `?`, `%`,

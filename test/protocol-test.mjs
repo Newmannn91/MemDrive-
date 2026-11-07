@@ -761,6 +761,43 @@ async function main() {
       assert.equal(detectImageMime(Buffer.from('GIF800 not a gif')), null);
     });
 
+    await check('cumulative image budget ceiling aborts an endless stream promptly when the budget is reached', async () => {
+      const chunk64k = Buffer.alloc(65_536, 0xaa);
+      const streamServer = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'image/png' });
+        const pump = () => {
+          while (!res.destroyed && !res.writableEnded) {
+            if (!res.write(chunk64k)) {
+              res.once('drain', pump);
+              return;
+            }
+          }
+        };
+        pump();
+      });
+      await new Promise((resolve) => streamServer.listen(0, '127.0.0.1', resolve));
+      const streamPort = streamServer.address().port;
+      try {
+        const budget = {
+          storedRemainingBytes: 1_000_000,
+          downloadRemainingBytes: 1_000_000,
+        };
+        const t0 = Date.now();
+        const res = await acquireImage(
+          `http://127.0.0.1:${streamPort}/endless.png`,
+          budget,
+          { isAllowedAddress: () => true },
+        );
+        const elapsedMs = Date.now() - t0;
+        assert.equal(res.ok, false);
+        assert.match(res.note, /download limit|stored image budget/i);
+        assert.equal(budget.downloadRemainingBytes, 0, 'downloadRemainingBytes must be drained to 0');
+        assert.ok(elapsedMs < 5_000, `abort must return promptly, took ${elapsedMs} ms`);
+      } finally {
+        streamServer.close();
+      }
+    });
+
     await check('acquireImage refuses without fetching when either budget is exhausted', async () => {
       // 0.7.0 follow-up (#4, partial): the pre-checks refuse before
       // any fetch, so they are testable offline. The full

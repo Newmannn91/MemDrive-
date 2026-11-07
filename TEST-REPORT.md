@@ -1131,41 +1131,8 @@ What is NOT covered by the automated suite (stated plainly):
 - The redirect limit (5) and redirect-target validation: not
   covered by an automated test, for the same reason (no public
   endpoint in the test environment).
-- The 500 MB cumulative image budget per save: no automated test.
-  The count cap (10 images) is tested; the cumulative path is
-  verified by code inspection only — the suite has no public
-  endpoint, and a 500 MB-plus fixture is not practical to build.
 - The GitHub Actions workflow file has never run: it runs on the
-  first push / pull request after this version is pushed.
-
-### 0.7.0 follow-up: final review fixes (2026-11-06)
-
-- DNS rebinding guard (`src/net-guard.ts` + `src/images.ts`): replaced
-  `fetch` in `downloadImage` with `safeRequest` over `node:http` /
-  `node:https` (`agent: false`, custom `lookup` supporting both
-  `options.all === true` and single-address callbacks, single DNS
-  resolution per request, connection-time validation of literal IPv4 /
-  bracketed IPv6 and all resolved addresses, `User-Agent` and
-  `Accept: image/*` headers).
-- Tightened image detection (`src/images.ts`, `src/tools.ts`): magic-byte
-  sniffing is restricted to extensionless files (`ext === ''`) across
-  `read_file`, bundled Markdown reads, `open_image`, and `copyLocalImage`;
-  BMP magic check verifies reserved bytes === 0 and standard DIB header
-  sizes `{12, 40, 52, 56, 64, 108, 124}`; GIF checks `GIF87a`/`GIF89a`.
-- `encodeImageSrc` (`src/images.ts`): preserves readable CJK characters
-  while percent-encoding ASCII and non-ASCII whitespace (including
-  full-width space `\u3000`), BOM, control characters, `%`, `(`, `)`,
-  `#`, `?`, `<`, `>`, `[`, `]`, quotes, backtick, and backslash.
-- Atomic writes & budgets (`src/atomic.ts`, `src/storage.ts`,
-  `src/tools.ts`, `src/images.ts`): random `.mdtmp-<hex>` opened with
-  `'wx'` and `mode ?? 0o666`, `SandboxError` / `MemDriveError('READ_ONLY')`
-  error types, `Object.hasOwn` for MIME maps, `mode: 'new'` pre-check
-  before image acquisition, and download `ceiling` bounded by
-  `storedRemainingBytes`.
-- Protocol/unit test suite (`test/protocol-test.mjs`): **97/97 checks
-  passed** (94 earlier checks + 3 new checks in this round: DNS
-  rebinding guard (including the stored-budget download ceiling),
-  full-width space image ref, and `mode: 'new'` pre-check). The
+  first push / pull request after this version is pushed. The
   matrix (3 OS × Node 24/26) is unverified until then.
 - `setup.bat` CRLF intact after the Node-version edit (71 CRLF
   lines, verified).
@@ -1324,19 +1291,49 @@ VM verification (2026-11-06, Node v24.22.1):
 
 What is NOT covered by the automated suite (stated plainly):
 
-- The full "failed download does not consume stored budget"
-  path: only the budget pre-checks are tested (offline-safe).
-  The suite has no public endpoint, so no test downloads a real
-  image from a public URL, and a 500 MB-plus fixture is not
-  practical to build. The stored-budget deduction point (after
-  download + mime check) is verified by code inspection only.
-- The 500 MB cumulative stored-image budget per save: no
-  automated test, same reason as above.
 - The redirect limit (5) and redirect-target validation: not
   covered by an automated test (no public endpoint).
-- The Windows rename retry (EPERM/EBUSY backoff) and the
-  wizard's manual-snippet-on-throw path: no automated test —
-  both need a locked file / a throwing write, which the suite
-  does not simulate.
+- The wizard's manual-snippet-on-throw path: no automated test —
+  needs a throwing host-config write, which the suite does not
+  simulate.
 - The GitHub Actions workflow file has never run: it runs on the
   first push / pull request after this version is pushed.
+
+### 0.7.0 follow-up: final review fixes & budget ceiling test (2026-11-06)
+
+- DNS rebinding guard (`src/net-guard.ts` + `src/images.ts`): replaced
+  `fetch` in `downloadImage` with `safeRequest` over `node:http` /
+  `node:https` (`agent: false`, custom `lookup` supporting both
+  `options.all === true` and single-address callbacks, single DNS
+  resolution per request, connection-time validation of literal IPv4 /
+  bracketed IPv6 and all resolved addresses, `User-Agent` and
+  `Accept: image/*` headers).
+- Tightened image detection (`src/images.ts`, `src/tools.ts`): magic-byte
+  sniffing is restricted to extensionless files (`ext === ''`) across
+  `read_file`, bundled Markdown reads, `open_image`, and `copyLocalImage`;
+  BMP magic check verifies reserved bytes === 0 and standard DIB header
+  sizes `{12, 40, 52, 56, 64, 108, 124}`; GIF checks `GIF87a`/`GIF89a`.
+- `encodeImageSrc` (`src/images.ts`): preserves readable CJK characters
+  while percent-encoding ASCII and non-ASCII whitespace (including
+  full-width space `\u3000`), BOM, control characters, `%`, `(`, `)`,
+  `#`, `?`, `<`, `>`, `[`, `]`, quotes, backtick, and backslash.
+- Atomic writes & budgets (`src/atomic.ts`, `src/storage.ts`,
+  `src/tools.ts`, `src/images.ts`): random `.mdtmp-<hex>` opened with
+  `'wx'` and `mode ?? 0o666`, `SandboxError` / `MemDriveError('READ_ONLY')`
+  error types, `Object.hasOwn` for MIME maps, `mode: 'new'` pre-check
+  before image acquisition, and download `ceiling` bounded by
+  `min(URL_DOWNLOAD_MAX_BYTES, downloadRemainingBytes, storedRemainingBytes)`.
+- Cumulative image budget automated test (`test/protocol-test.mjs`):
+  `cumulative image budget ceiling aborts an endless stream promptly
+  when the budget is reached` — streams continuous 64 KB chunks from a
+  local HTTP server on `127.0.0.1` into `acquireImage` with an injected
+  1 MB budget (`{ storedRemainingBytes: 1_000_000,
+  downloadRemainingBytes: 1_000_000 }`) and `{ isAllowedAddress: () =>
+  true }`, verifying the stream aborts promptly with `ok: false`, a
+  budget-reached note, and `downloadRemainingBytes` drained to 0.
+- Protocol/unit test suite (`test/protocol-test.mjs`): **98/98 checks
+  passed** (82 earlier checks + 16 new regression checks covering all
+  0.7.0 follow-ups including cumulative budget stream abort, DNS
+  rebinding, full-width space image refs, `"BM"`/`"GIF8"` text notes,
+  atomicWrite mode/symlink/read-only/retry, and `mode: 'new'`
+  pre-check).
