@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+# Test scratch dirs (created under the OS temp dir by the test suite, but
+# keep the repo clean if a developer points MEMDRIVE_ROOT here by mistake)
+memdrive-test-*/
