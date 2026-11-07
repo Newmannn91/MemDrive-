@@ -8,11 +8,11 @@
 # Run from this script's own directory, wherever it was started from.
 cd "$(dirname "$0")" || exit 1
 
-# 1. Node.js must be installed. MemDrive needs Node 18 or newer.
+# 1. Node.js must be installed. MemDrive needs Node 24 or newer.
 if ! command -v node >/dev/null 2>&1; then
   echo
   echo "Node.js is not installed on this computer."
-  echo "MemDrive needs Node.js 18 or newer. Download it from the"
+  echo "MemDrive needs Node.js 24 or newer. Download it from the"
   echo "official site (it is free), install it, then run setup.sh again."
   echo
   printf "Open https://nodejs.org in your browser now? [y/N] "
@@ -32,7 +32,7 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 node -v
-if ! node -e "if (Number(process.versions.node.split('.')[0]) < 18) { console.error('Node.js 18 or newer is required. Your version is ' + process.version + '. Please update Node.js, then run setup.sh again.'); process.exit(1); }"; then
+if ! node -e "if (Number(process.versions.node.split('.')[0]) < 24) { console.error('Node.js 24 or newer is required. Your version is ' + process.version + '. Please update Node.js, then run setup.sh again.'); process.exit(1); }"; then
   echo "Setup stopped. Nothing was changed."
   exit 1
 fi

@@ -107,6 +107,7 @@ export const IMAGE_EXTENSIONS = new Set([
     '.gif',
     '.bmp',
     '.tiff',
+    '.tif',
 ]);
 /** `.svg` files are XML text: read_file returns them as text, never as image content. */
 export const SVG_EXTENSION = '.svg';
@@ -126,6 +127,23 @@ export const URL_DOWNLOAD_TIMEOUT_MS = 30_000;
  * orders of magnitude below it.
  */
 export const URL_DOWNLOAD_MAX_BYTES = 500_000_000;
+/** Maximum images attached in one save_file call. */
+export const SAVE_MAX_IMAGES = 10;
+/**
+ * Maximum total image bytes acquired in one save_file call (URL
+ * downloads, local copies, and clipboard images counted together).
+ * The per-download ceiling (URL_DOWNLOAD_MAX_BYTES) still applies to
+ * each URL on its own; this bounds the total per save.
+ */
+export const SAVE_IMAGES_MAX_TOTAL_BYTES = 500_000_000;
+/**
+ * Maximum total bytes actually downloaded from URLs in one save_file
+ * call. This is a separate counter from SAVE_IMAGES_MAX_TOTAL_BYTES:
+ * a failed or non-image download spends download traffic, never
+ * stored-image budget, so one bad URL cannot eat the whole stored
+ * budget and block every later image.
+ */
+export const SAVE_IMAGES_MAX_DOWNLOAD_BYTES = 500_000_000;
 /** Timeout for a single native clipboard command. */
 export const CLIPBOARD_COMMAND_TIMEOUT_MS = 10_000;
 /** Max bytes captured from a clipboard command's stdout. */
@@ -141,8 +159,8 @@ export function resolveRootDir() {
     const configured = raw && raw.length > 0 ? raw : '~/memdrive';
     const expanded = configured === '~'
         ? homedir()
-        : configured.startsWith('~/')
-            ? path.join(homedir(), configured.slice(2))
+        : configured.startsWith('~/') || configured.startsWith('~\\')
+            ? path.join(homedir(), configured.slice(2).replace(/\\/g, '/'))
             : configured;
     return path.resolve(expanded);
 }

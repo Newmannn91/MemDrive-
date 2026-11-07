@@ -2,22 +2,14 @@
 
 An MCP server that gives LLMs persistent memory on your own storage: a
 local folder (Google Drive / OneDrive / iCloud sync folder, or any plain
-directory) today. WebDAV (NAS, Nextcloud, Alist/Rclone) is
-interface-reserved behind the `StorageBackend` interface but not
-implemented; whether it is implemented later depends on user
-feedback, and it will only be considered if the user base is large
-with clear demand.
+directory). Local only, by design.
 
 The model reads and writes **Markdown + a sibling `assets/` image folder**
 through six small tools. No cloud service, no account, no server to run —
 the MCP server runs on your own machine and touches only the folder you
 point it at.
 
-> **Status: MVP 0.6.0.** Local filesystem backend only. WebDAV is
-> interface-reserved behind the `StorageBackend` interface but not
-> implemented. Whether it is implemented later depends on user
-> feedback, and it will only be considered if the user base is large
-> with clear demand.
+> **Status: 0.7.0.** Local filesystem backend only.
 > 0.1.1 added one total response budget to `read_file` (see
 > [Reading back](#reading-back-packed-two-step-and-single-image) and
 > [Limits](#limits-all-in-srcconfigts-nowhere-else)) and put the
@@ -50,7 +42,7 @@ point it at.
 
 ## Quick start
 
-Requires Node.js 18+.
+Requires Node.js 24+.
 
 **Easiest — setup wizard (recommended for first install).** Download
 the release zip, extract it, and run the launcher for your system
@@ -62,7 +54,7 @@ the Claude Desktop, Cursor, VS Code, or Claude Code config):
 - macOS: double-click `setup.command` (or run `./setup.sh` in a terminal)
 - Linux: run `./setup.sh` in a terminal
 
-The wizard needs Node.js 18+ already installed; if it is missing, the
+The wizard needs Node.js 24+ already installed; if it is missing, the
 launcher says so and offers to open https://nodejs.org for you. It
 never installs anything silently and never changes a config file
 without backing it up first (see [Setup](#setup-wizard--launchers)).
@@ -337,7 +329,7 @@ What the wizard does, in order:
 
 The launchers (`setup.bat` for Windows, `setup.sh` for macOS/Linux,
 `setup.command` for double-clicking on macOS) are thin shells: they
-check for Node.js 18+, run `npm install` + `npm run build` (failures
+check for Node.js 24+, run `npm install` + `npm run build` (failures
 shown plainly, script stops), then run the wizard. All logic stays
 in Node; the scripts contain no configuration of their own.
 
@@ -582,10 +574,6 @@ stays on v1.x until there is a reason to migrate.
 
 ## Roadmap (not in this MVP)
 
-- WebDAV: interface reserved behind the existing `StorageBackend`
-  interface but not implemented. Whether it is implemented later
-  depends on user feedback, and it will only be considered if the
-  user base is large with clear demand.
 - Windows clipboard capture verified on real hardware (2026-10-28,
   screenshot save via Claude Desktop); the macOS clipboard branch is
   still implemented from the documented OS pattern only — no macOS

@@ -35,14 +35,14 @@ export function cleanPath(input) {
         }
         break;
     }
-    if (p === '~') {
-        return homedir();
-    }
-    if (p.startsWith('~/') || p.startsWith('~\\')) {
-        return path.join(homedir(), p.slice(2));
-    }
     // Normalize Windows-style separators so `a\b` and `a/b` mean the same.
     const unified = p.replace(/\\/g, '/');
+    if (unified === '~') {
+        return homedir();
+    }
+    if (unified.startsWith('~/')) {
+        return path.join(homedir(), unified.slice(2));
+    }
     return path.normalize(unified);
 }
 /** True when `target` is `dir` itself or lives underneath it. */
@@ -69,7 +69,10 @@ export function resolveInRoot(rootDir, input) {
  * yet: walk up to the nearest existing ancestor, realpath it, then re-join
  * the remaining segments.
  */
-async function realLocation(absolutePath) {
+async function realLocation(absolutePath, depth = 0) {
+    if (depth > 32) {
+        throw new SandboxError(`Too many levels of symbolic links: ${absolutePath}`);
+    }
     const missing = [];
     let current = absolutePath;
     for (;;) {
@@ -85,6 +88,27 @@ async function realLocation(absolutePath) {
             const code = error.code;
             if (code !== 'ENOENT' && code !== 'ENOTDIR') {
                 throw error;
+            }
+            if (code === 'ENOENT') {
+                try {
+                    const lst = await fs.lstat(current);
+                    if (lst.isSymbolicLink()) {
+                        const linkTarget = await fs.readlink(current);
+                        const resolvedLink = path.resolve(path.dirname(current), linkTarget);
+                        const realTarget = await realLocation(resolvedLink, depth + 1);
+                        let result = realTarget;
+                        for (let i = missing.length - 1; i >= 0; i -= 1) {
+                            result = path.join(result, missing[i]);
+                        }
+                        return result;
+                    }
+                }
+                catch (linkError) {
+                    if (linkError instanceof SandboxError) {
+                        throw linkError;
+                    }
+                    // Not an existing symlink; continue walking up to parent.
+                }
             }
             const parent = path.dirname(current);
             if (parent === current) {

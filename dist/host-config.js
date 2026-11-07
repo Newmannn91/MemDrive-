@@ -78,6 +78,7 @@
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { atomicWrite } from './atomic.js';
 function probePlatform(deps) {
     return deps.platform ?? process.platform;
 }
@@ -438,12 +439,14 @@ export function mergeConfigJson(existingText, adapter, entry) {
 }
 /**
  * Write `entry` into a host config file via `adapter`: back up
- * first, then merge and write. Missing files are never created
- * unless the adapter sets `createIfMissing` (Cursor and VS Code,
- * and only when the host directory already exists — the caller
- * decides that via `findConfigPaths`); a created file takes no
- * backup. Corrupt files are never touched. The `fs` parameter is
- * injectable for temp-dir tests; defaults to the real filesystem.
+ * first, then merge and write the merged content atomically (temp
+ * file in the same folder, then rename over the target). Missing
+ * files are never created unless the adapter sets `createIfMissing`
+ * (Cursor and VS Code, and only when the host directory already
+ * exists — the caller decides that via `findConfigPaths`); a created
+ * file takes no backup. Corrupt files are never touched. The `fs`
+ * parameter is injectable for temp-dir tests; defaults to the real
+ * filesystem.
  */
 export async function writeHostConfig(adapter, configPath, entry, fileSystem = fs) {
     let existing;
@@ -487,6 +490,10 @@ export async function writeHostConfig(adapter, configPath, entry, fileSystem = f
         ? `${plainBackup}-${backupTimestamp(new Date())}`
         : plainBackup;
     await fileSystem.copyFile(configPath, backupPath);
-    await fileSystem.writeFile(configPath, merged.text, 'utf8');
+    // Atomic replace via the shared helper (resolves symlinks,
+    // preserves permissions, refuses read-only targets, fsyncs,
+    // retries Windows locks). The temp file is removed if any step
+    // fails. Backup behaviour above is unchanged.
+    await atomicWrite(configPath, merged.text, { fs: fileSystem });
     return { status: 'written', configPath, backupPath };
 }

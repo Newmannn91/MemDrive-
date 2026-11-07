@@ -1077,3 +1077,266 @@ read, the snippet path when the file is missing, and the
 on any of these is a failure of the 0.6.0 adapter, to be
 diagnosed from the exact error and the exact file contents
 reported by the user, not from guesses.
+
+## §18 — 0.7.0 Foundation (2026-11-06)
+
+Foundation release, no new features. Two security fixes, a Node
+floor raise, CI, and the permanent removal of WebDAV:
+
+- `search_files` symlink hole fixed (`src/storage.ts`): the search
+  walk used to follow a symlink inside the root to a small outside
+  text file, read its content, and return its matching line as an
+  excerpt. The walk now skips any entry whose real location escapes
+  the root (realpath check per entry); within-root symlinks behave
+  like the files they point at, matching `read_file`'s rule.
+  Regression test added: `search_files never leaks content through
+  a symlink to an outside file`.
+- Image URL download hardened (`src/images.ts`): explicit redirect
+  limit of 5 (manual redirect handling), and every fetch target —
+  initial URL and each redirect target — must resolve to a public
+  address. Loopback, private (RFC 1918 / ULA), link-local
+  (including 169.254.169.254), and other non-routable ranges are
+  refused before fetching. 30 s timeout, 500 MB ceiling, and the
+  image-format check are unchanged. No new dependencies.
+- Node floor raised to 24: `engines >=24` in `package.json`;
+  `setup.bat`, `setup.sh`, and `setup.command` all require Node 24
+  or newer. Node 22 support ends 2027-04-30.
+- GitHub Actions CI added (`.github/workflows/ci.yml`): 3 OS
+  (windows-latest, ubuntu-latest, macos-latest) × Node 24 and 26;
+  on push and pull_request runs `npm ci`, `npm run typecheck`,
+  `npm run build`, `npm test`.
+- `npm prepack` added (`npm run build`), so published packages are
+  always built from current source.
+- WebDAV removed permanently, local-only: mentions deleted from
+  `README.md`, `package.json` (description and keywords), and the
+  header comments of `src/storage.ts` and `src/index.ts`.
+  `CHANGELOG.md` and this report keep their historical mentions.
+
+VM verification (2026-11-06, Node v24.22.1):
+
+- `npm run typecheck` clean; `npm run build` clean.
+- `npm test` **81/81** (80 existing + 1 new search-symlink
+  regression test). The old URL-download test
+  (`save_file with URL image downloads + archives`) was converted:
+  it now asserts a localhost image URL is refused with a note,
+  the text is still saved, and nothing is archived
+  (`save_file refuses a localhost image URL, text still saved`).
+
+What is NOT covered by the automated suite (stated plainly):
+
+- Image URL download success: the suite is self-contained and has
+  no public endpoint, so no test downloads a real image from a
+  public URL. The localhost-refusal test covers the new block, not
+  the happy path.
+- The redirect limit (5) and redirect-target validation: not
+  covered by an automated test, for the same reason (no public
+  endpoint in the test environment).
+- The 500 MB cumulative image budget per save: no automated test.
+  The count cap (10 images) is tested; the cumulative path is
+  verified by code inspection only — the suite has no public
+  endpoint, and a 500 MB-plus fixture is not practical to build.
+- The GitHub Actions workflow file has never run: it runs on the
+  first push / pull request after this version is pushed.
+
+### 0.7.0 follow-up: final review fixes (2026-11-06)
+
+- DNS rebinding guard (`src/net-guard.ts` + `src/images.ts`): replaced
+  `fetch` in `downloadImage` with `safeRequest` over `node:http` /
+  `node:https` (`agent: false`, custom `lookup` supporting both
+  `options.all === true` and single-address callbacks, single DNS
+  resolution per request, connection-time validation of literal IPv4 /
+  bracketed IPv6 and all resolved addresses, `User-Agent` and
+  `Accept: image/*` headers).
+- Tightened image detection (`src/images.ts`, `src/tools.ts`): magic-byte
+  sniffing is restricted to extensionless files (`ext === ''`) across
+  `read_file`, bundled Markdown reads, `open_image`, and `copyLocalImage`;
+  BMP magic check verifies reserved bytes === 0 and standard DIB header
+  sizes `{12, 40, 52, 56, 64, 108, 124}`; GIF checks `GIF87a`/`GIF89a`.
+- `encodeImageSrc` (`src/images.ts`): preserves readable CJK characters
+  while percent-encoding ASCII and non-ASCII whitespace (including
+  full-width space `\u3000`), BOM, control characters, `%`, `(`, `)`,
+  `#`, `?`, `<`, `>`, `[`, `]`, quotes, backtick, and backslash.
+- Atomic writes & budgets (`src/atomic.ts`, `src/storage.ts`,
+  `src/tools.ts`, `src/images.ts`): random `.mdtmp-<hex>` opened with
+  `'wx'` and `mode ?? 0o666`, `SandboxError` / `MemDriveError('READ_ONLY')`
+  error types, `Object.hasOwn` for MIME maps, `mode: 'new'` pre-check
+  before image acquisition, and download `ceiling` bounded by
+  `storedRemainingBytes`.
+- Protocol/unit test suite (`test/protocol-test.mjs`): **97/97 checks
+  passed** (94 earlier checks + 3 new checks in this round: DNS
+  rebinding guard (including the stored-budget download ceiling),
+  full-width space image ref, and `mode: 'new'` pre-check). The
+  matrix (3 OS × Node 24/26) is unverified until then.
+- `setup.bat` CRLF intact after the Node-version edit (71 CRLF
+  lines, verified).
+
+### 0.7.0 follow-up: image caps + atomic writes (2026-11-06)
+
+- save_file image caps (`src/config.ts`, `src/images.ts`,
+  `src/tools.ts`): at most 10 images per save; all images acquired
+  in one save together at most 500 MB. The per-download ceiling
+  (500 MB) is unchanged — no new per-image cap. A per-save byte
+  budget is threaded through `acquireImage` into the URL download
+  (the stream stops at the remaining budget), local copies
+  (stat-first refusal), and clipboard images. Hitting either cap
+  stops the loop with a note naming the cap; the text is still
+  saved. Regression test added: `save_file with more than 10
+  images processes only 10, text still saved`. (Superseded in
+  part by the review fixes below: the single budget is now two
+  counters — download traffic and stored images — and only the
+  stored budget stops the loop.)
+- Config write atomicity (`src/host-config.ts`): backup behavior
+  unchanged (.bak, else .bak-<timestamp>; corrupt configs
+  untouched). The merged write now goes to a temp file in the same
+  folder, then rename over the target; the temp file is removed if
+  either step fails. The create-if-missing path is unchanged (new
+  file, nothing to protect).
+- Note overwrite atomicity (`src/storage.ts`): `writeFile`
+  'overwrite' mode now writes to a temp file in the same directory,
+  then renames over the target; temp removed on failure. 'new'
+  ('wx') and 'append' modes unchanged.
+
+VM verification (2026-11-06, Node v24.22.1):
+
+- `npm run typecheck` clean; `npm run build` clean.
+- `npm test` **82/82** (81 existing + 1 new image-count regression
+  test), run twice with the same result; the new test is confirmed
+  by name in the output.
+
+### Windows manual test records — for the user to fill in
+
+2026-11-06, Windows, Node v24.21.0:
+
+- `npm test` in PowerShell: **82/82 checks passed**.
+- Claude Desktop: connected; list_directory, clipboard-image save
+  (notes/2026-11-06-图片笔记.md, original 2.01 MB), open_image,
+  open_containing_folder, read_file all worked.
+- VS Code (Copilot Fusion, MAI-Code-1.1-Flash): connected;
+  list_directory, clipboard-image save (notes/clipboard-image.md),
+  open_image, open_containing_folder, read_file all worked.
+- Cursor: NOT tested — weekly usage limit reached, resets in 1
+  day. Retest 2026-11-07.
+
+### 0.7.0 follow-up: second-review fixes (2026-11-06)
+
+A second Claude Desktop review (Sonnet 5.5 + High, against the
+full source) found 11 issues; each was verified against the code
+before fixing. All fixes below are in the same unreleased 0.7.0.
+
+- Assets symlink escape (#1, `src/tools.ts`): the doc path was
+  sandbox-checked but the `assets/` folder was not, so a symlink
+  inside the library pointing outside let images be written
+  outside the root. The assets folder is now sandbox-checked
+  before `ensureDir`; on failure the images are refused with a
+  note and the text still saves. Test:
+  `save_file refuses to store images when assets/ links outside
+  the library`.
+- Non-regular local images (#3, `src/images.ts`): `copyLocalImage`
+  now stats first, refuses anything that is not a regular file
+  (`/dev/zero`, FIFOs, device nodes — all report size 0, so a
+  size check alone cannot stop an unbounded read), and reports a
+  stat failure directly instead of falling through to a
+  misleading read error. After read, a file that grew past the
+  stored budget is refused. Test:
+  `save_file refuses non-regular local images, server survives`
+  (directory fixture cross-platform; `/dev/null` on non-Windows).
+- Windows viewer command injection (#9, `src/viewer.ts`):
+  `launchViewer` refuses paths containing `& | < > ^ %` on win32
+  before spawning (cmd.exe re-parses the line; the old header
+  comment claiming a crafted filename "cannot inject a second
+  command" was wrong on Windows and is corrected). Both
+  `openInViewer` and `openFolderInViewer` go through
+  `launchViewer`. The launch mechanism itself is unchanged
+  (no rundll32 this round). Test:
+  `openInViewer/openFolderInViewer refuse Windows shell
+  metacharacters without spawning`.
+- Shared atomic-write helper (#5/#6/#7/#8, new `src/atomic.ts`,
+  used by `src/storage.ts` and `src/host-config.ts`): resolves
+  symlinks (with a sandbox check when a root is given), preserves
+  permissions, refuses read-only targets, fsyncs, retries Windows
+  locks (EPERM/EBUSY/EACCES, 5 attempts, 50/100/150/200 ms
+  backoff), and throws when retries are exhausted (never falls
+  back to in-place writing). The reviewer's draft had the ENOENT
+  condition backwards; the helper treats ENOENT as "new file" and
+  rethrows only non-ENOENT errors. `writeFile` 'overwrite' now
+  returns `created:false` for an existing file and `created:true`
+  for a missing one (#8, pre-existing since 0.6.0). The temp name
+  is a short random `.mdtmp-<hex>` (12 hex chars, opened with `wx` and the target's mode) in the same directory, so
+  a 243-byte filename no longer fails with ENAMETOOLONG on
+  overwrite (#7). `listDirectory` skips `.mdtmp-*` entries, so
+  orphaned temp files never appear as notes in listings or
+  search. 'new' ('wx'), 'append', the create-if-missing config
+  path, and backup behavior are all unchanged. Tests:
+  `save_file overwrite of a 243-byte name does not fail with
+  ENAMETOOLONG` (non-Windows only), `save_file overwrite reports
+  created:false for existing, created:true for missing`.
+- Image refs with spaces/parens (#2, `src/tools.ts` +
+  `src/images.ts`): refs are percent-encoded on write
+  (encodeURIComponent plus `(` → `%28`, `)` → `%29`) and decoded
+  in `scanMarkdownImages` (try/catch, raw src on failure), for
+  both the inline `![...](...)` and `<img src=...>` patterns.
+  Only newly saved notes get encoded refs; pre-existing notes
+  are unchanged. Test: `save_file with spaces/parens in the doc
+  name writes an encoded ref that reads back`.
+- Split image budgets (#4, `src/images.ts` + `src/tools.ts`):
+  one per-save download-traffic counter (500 MB) and one
+  stored-image budget (500 MB). The download stream stops at
+  min(per-download ceiling 500 MB, remaining download traffic)
+  and spends traffic per chunk; the stored budget is deducted
+  only after a download completes and passes the mime check, so
+  a failed or non-image download no longer blocks later
+  legitimate images. Local copies and clipboard images deduct
+  after their checks as before. Pre-checks refuse without
+  fetching when either counter is exhausted; notes name which
+  cap was hit; the doubled `skipped:` prefix is removed. Only
+  the stored budget stops the image loop. Test (pre-checks only):
+  `acquireImage refuses without fetching when either budget is
+  exhausted`.
+- Windows rename retry + wizard snippet (#10, `src/atomic.ts` +
+  `src/wizard.ts`): rename retries as described above; on a
+  `writeHostConfig` throw the wizard prints the manual config
+  snippet plus a plain error instead of only
+  `Setup stopped: ...`.
+- IPv6 SSRF ranges (#11, `src/images.ts`): `isPublicIpv6` also
+  blocks 64:ff9b::/96 (NAT64), 2002::/16 (6to4), fec0::/10
+  (site-local), and 2001::/32 (Teredo). DNS-rebinding fix NOT
+  attempted (needs IP pinning — deferred). Found while testing:
+  Node's `URL.hostname` keeps the brackets on IPv6 literals,
+  which `dns.lookup` cannot resolve, so a literal IPv6 URL never
+  reached the range check and was misreported as "host could not
+  be resolved". `blockedUrlReason` now checks a literal address
+  directly, without DNS. Test: `save_file refuses image URLs in
+  NAT64/6to4 IPv6 ranges, text still saved` (literal IPs need no
+  DNS).
+- NOT fixed in this round (per the task): DNS rebinding, CJK
+  alt text becoming "image", `read_file` whole-file read,
+  `.png`-extension fallback for non-images, mode:new pre-check.
+
+VM verification (2026-11-06, Node v24.22.1):
+
+- `npm run typecheck` clean; `npm run build` clean.
+- `npm test` **90/90** (82 existing + 8 new regression tests),
+  run twice with the same result; all 8 new tests confirmed by
+  name in the output. The first run was 89/90: the IPv6 test
+  failed because literal IPv6 URLs never reached the range
+  check (the `URL.hostname` brackets issue above); fixed in
+  `blockedUrlReason` and re-run green.
+
+What is NOT covered by the automated suite (stated plainly):
+
+- The full "failed download does not consume stored budget"
+  path: only the budget pre-checks are tested (offline-safe).
+  The suite has no public endpoint, so no test downloads a real
+  image from a public URL, and a 500 MB-plus fixture is not
+  practical to build. The stored-budget deduction point (after
+  download + mime check) is verified by code inspection only.
+- The 500 MB cumulative stored-image budget per save: no
+  automated test, same reason as above.
+- The redirect limit (5) and redirect-target validation: not
+  covered by an automated test (no public endpoint).
+- The Windows rename retry (EPERM/EBUSY backoff) and the
+  wizard's manual-snippet-on-throw path: no automated test —
+  both need a locked file / a throwing write, which the suite
+  does not simulate.
+- The GitHub Actions workflow file has never run: it runs on the
+  first push / pull request after this version is pushed.

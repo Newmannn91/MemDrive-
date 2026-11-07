@@ -33,7 +33,10 @@ import {
   vscodeAdapter,
   writeHostConfig,
 } from '../dist/host-config.js';
-import { folderCommandFor, viewerCommandFor } from '../dist/viewer.js';
+import { atomicWrite } from '../dist/atomic.js';
+import { acquireImage, detectImageMime, encodeImageSrc, extensionForMime, mimeFromExtension } from '../dist/images.js';
+import { BlockedUrlError, safeRequest } from '../dist/net-guard.js';
+import { folderCommandFor, openFolderInViewer, openInViewer, viewerCommandFor } from '../dist/viewer.js';
 import { resolveContainingFolder } from '../dist/tools.js';
 import {
   buildServerEntry,
@@ -334,7 +337,12 @@ async function main() {
       assert.ok(stored.equals(smallPng), 'stored image must be byte-identical to the source');
     });
 
-    await check('save_file with URL image downloads + archives', async () => {
+    await check('save_file refuses a localhost image URL, text still saved', async () => {
+      // 0.7.0: image URLs must resolve to a public address. A localhost
+      // URL is refused before fetching (SSRF guard), so the old
+      // "downloads + archives" expectation no longer applies. The
+      // success path has no public endpoint in this self-contained
+      // suite and is not covered here.
       const res = await call('save_file', {
         path: 'notes/from-url.md',
         content: '# From URL',
@@ -342,7 +350,434 @@ async function main() {
       });
       assert.equal(res.isError, undefined, textOf(res));
       const doc = await fs.readFile(path.join(root, 'notes/from-url.md'), 'utf8');
-      assert.match(doc, /!\[shot\]\(assets\/from-url-.*\.png\)/);
+      assert.equal(doc, '# From URL');
+      assert.match(textOf(res), /skipped/i);
+      assert.match(textOf(res), /not a public address/i);
+      const assets = await fs.readdir(path.join(root, 'notes/assets'));
+      assert.ok(!assets.some((n) => n.startsWith('from-url-')), 'no image from a refused URL must be archived');
+    });
+
+    await check('save_file with more than 10 images processes only 10, text still saved', async () => {
+      // 0.7.0: at most 10 images per save; the rest are skipped with
+      // a note naming the cap, and the text is still saved.
+      const specs = Array.from({ length: 12 }, () => smallPngPath);
+      const res = await call('save_file', {
+        path: 'notes/many.md',
+        content: '# Many',
+        images: specs,
+      });
+      assert.equal(res.isError, undefined, textOf(res));
+      const doc = await fs.readFile(path.join(root, 'notes/many.md'), 'utf8');
+      assert.match(doc, /# Many/);
+      assert.match(textOf(res), /only the first 10 images were processed/);
+      assert.match(textOf(res), /2 more image\(s\) were skipped/);
+      const assets = await fs.readdir(path.join(root, 'notes/assets'));
+      const many = assets.filter((n) => n.startsWith('many-'));
+      assert.equal(many.length, 10, `expected 10 stored images, got ${many.length}: ${many.join(', ')}`);
+    });
+
+    await check('save_file refuses to store images when assets/ links outside the library', async () => {
+      // 0.7.0 follow-up (#1): the doc path is sandbox-checked, but
+      // the assets folder was not — a symlink inside the library
+      // pointing outside let images be written outside the root.
+      const escDir = path.join(root, 'esc');
+      const outsideAssets = path.join(outside, 'assets-out');
+      await fs.mkdir(escDir, { recursive: true });
+      await fs.mkdir(outsideAssets, { recursive: true });
+      await fs.symlink(outsideAssets, path.join(escDir, 'assets'), 'junction');
+      const res = await call('save_file', {
+        path: 'esc/doc.md',
+        content: '# Esc',
+        images: [smallPngPath],
+      });
+      assert.equal(res.isError, undefined, textOf(res));
+      const doc = await fs.readFile(path.join(root, 'esc/doc.md'), 'utf8');
+      assert.equal(doc, '# Esc');
+      assert.match(textOf(res), /links outside the library/i);
+      const leaked = await fs.readdir(outsideAssets);
+      assert.equal(leaked.length, 0, 'no image must be written outside the library');
+    });
+
+    await check('save_file refuses non-regular local images, server survives', async () => {
+      // 0.7.0 follow-up (#3): /dev/zero, FIFOs, and device nodes
+      // report size 0, so a size check alone cannot stop an
+      // unbounded read. A directory is a cross-platform fixture
+      // for "not a regular file".
+      const dirPath = path.join(scratch, 'somedir');
+      await fs.mkdir(dirPath, { recursive: true });
+      const res = await call('save_file', {
+        path: 'notes/not-a-file.md',
+        content: '# Dir',
+        images: [dirPath],
+      });
+      assert.equal(res.isError, undefined, textOf(res));
+      const doc = await fs.readFile(path.join(root, 'notes/not-a-file.md'), 'utf8');
+      assert.equal(doc, '# Dir');
+      assert.match(textOf(res), /Not a regular file/i);
+      if (process.platform !== 'win32') {
+        // /dev/null is a character device: stat succeeds, isFile()
+        // is false, and the old code would have read it forever
+        // (on /dev/zero) or until OOM. Refusal must be immediate.
+        const resNull = await call('save_file', {
+          path: 'notes/dev-null.md',
+          content: '# Null',
+          images: ['/dev/null'],
+        });
+        assert.equal(resNull.isError, undefined, textOf(resNull));
+        assert.match(textOf(resNull), /Not a regular file/i);
+      }
+    });
+
+    if (process.platform !== 'win32') {
+      await check('save_file overwrite of a 243-byte name does not fail with ENAMETOOLONG', async () => {
+        // 0.7.0 follow-up (#7): the old temp name appended ~30
+        // characters to the target name, so a 243-byte filename
+        // overflowed the 255-byte limit on overwrite. The shared
+        // helper uses a short fixed temp name instead. Windows is
+        // skipped: MAX_PATH makes even the plain create fail there.
+        const longName = `${'n'.repeat(240)}.md`;
+        assert.equal(Buffer.byteLength(longName), 243);
+        const longRel = `notes/${longName}`;
+        const created = await call('save_file', { path: longRel, content: '# Long', mode: 'new' });
+        assert.equal(created.isError, undefined, textOf(created));
+        const over = await call('save_file', { path: longRel, content: '# Longer', mode: 'overwrite' });
+        assert.equal(over.isError, undefined, textOf(over));
+        assert.equal(await fs.readFile(path.join(root, longRel), 'utf8'), '# Longer');
+      });
+    }
+
+    await check('save_file overwrite reports created:false for existing, created:true for missing', async () => {
+      // 0.7.0 follow-up (#8): the overwrite branch returned
+      // created:true unconditionally (pre-existing since 0.6.0).
+      await call('save_file', { path: 'notes/flag.md', content: '# v1', mode: 'new' });
+      const over = await call('save_file', { path: 'notes/flag.md', content: '# v2', mode: 'overwrite' });
+      assert.equal(over.isError, undefined, textOf(over));
+      assert.doesNotMatch(textOf(over), /, created/);
+      const fresh = await call('save_file', { path: 'notes/fresh-flag.md', content: '# new', mode: 'overwrite' });
+      assert.equal(fresh.isError, undefined, textOf(fresh));
+      assert.match(textOf(fresh), /, created/);
+      assert.equal(await fs.readFile(path.join(root, 'notes/fresh-flag.md'), 'utf8'), '# new');
+    });
+
+    await check('save_file refuses image URLs in NAT64/6to4 IPv6 ranges, text still saved', async () => {
+      // 0.7.0 follow-up (#11): literal IPs need no DNS, so the
+      // SSRF range check is testable without a public endpoint.
+      const res = await call('save_file', {
+        path: 'notes/from-ipv6.md',
+        content: '# From IPv6',
+        images: ['http://[64:ff9b::c000:201]/x.png', 'http://[2002:c000:201::]/x.png'],
+      });
+      assert.equal(res.isError, undefined, textOf(res));
+      const doc = await fs.readFile(path.join(root, 'notes/from-ipv6.md'), 'utf8');
+      assert.equal(doc, '# From IPv6');
+      assert.match(textOf(res), /not a public address/i);
+      const assets = await fs.readdir(path.join(root, 'notes/assets'));
+      assert.ok(!assets.some((n) => n.startsWith('from-ipv6-')), 'no image from a refused URL must be archived');
+    });
+
+    await check('save_file with spaces/parens in the doc name writes an encoded ref that reads back', async () => {
+      // 0.7.0 follow-up (#2): the ref is percent-encoded on write
+      // and decoded on scan, so spaces and parentheses survive the
+      // scan regex instead of truncating the path.
+      const res = await call('save_file', {
+        path: 'notes/my notes (v1).md',
+        content: '# Spaced',
+        images: [smallPngPath],
+      });
+      assert.equal(res.isError, undefined, textOf(res));
+      const doc = await fs.readFile(path.join(root, 'notes/my notes (v1).md'), 'utf8');
+      assert.match(doc, /!\[shot\]\(assets\/my%20notes%20%28v1%29-\d{8}-\d{6}-\d{3}\.png\)/);
+      const read = await call('read_file', { path: 'notes/my notes (v1).md' });
+      assert.equal(read.isError, undefined, textOf(read));
+      assert.doesNotMatch(textOf(read), /Skipped image/);
+      assert.equal(imagesOf(read).length, 1, 'the referenced image must be returned by read_file');
+    });
+
+    await check('text notes starting with BM or GIF8 are read as text, rejected by open_image and save_file images', async () => {
+      const bmText = 'BM25 is a ranking function used by search engines to estimate relevance.';
+      const gifText = 'GIF89a is a classic graphics interchange format specification.';
+      await call('save_file', { path: 'notes/bm25.md', content: bmText, mode: 'new' });
+      await call('save_file', { path: 'notes/bm25.txt', content: bmText, mode: 'new' });
+      await call('save_file', { path: 'notes/gif.md', content: gifText, mode: 'new' });
+      await call('save_file', { path: 'notes/ref-bm25.md', content: '# Ref\n![bm](bm25.md)\n', mode: 'new' });
+
+      for (const rel of ['notes/bm25.md', 'notes/bm25.txt', 'notes/gif.md']) {
+        const readRes = await call('read_file', { path: rel });
+        assert.equal(readRes.isError, undefined, textOf(readRes));
+        assert.equal(imagesOf(readRes).length, 0, `${rel} must not return an image block`);
+        assert.match(textOf(readRes), /BM25|GIF89a/);
+      }
+
+      const bundledRef = await call('read_file', { path: 'notes/ref-bm25.md' });
+      assert.equal(bundledRef.isError, undefined, textOf(bundledRef));
+      assert.equal(imagesOf(bundledRef).length, 0, 'referencing bm25.md must not produce an image block');
+      assert.match(textOf(bundledRef), /unsupported image type/);
+
+      const openBm = await call('open_image', { path: 'notes/bm25.md' });
+      assert.equal(openBm.isError, true);
+      assert.match(textOf(openBm), /not an image/i);
+
+      const bm25LocalPath = path.join(scratch, 'BM25.txt');
+      await fs.writeFile(bm25LocalPath, bmText);
+      const saveWithBmTxt = await call('save_file', {
+        path: 'notes/with-bm-txt.md',
+        content: '# Try BM25.txt',
+        images: [bm25LocalPath],
+      });
+      assert.equal(saveWithBmTxt.isError, undefined, textOf(saveWithBmTxt));
+      assert.match(textOf(saveWithBmTxt), /does not look like an image/i);
+    });
+
+    await check('save_file with CJK, #, ?, spaces, and parens keeps CJK readable and reads image back', async () => {
+      const res = await call('save_file', {
+        path: 'notes/架构笔记 #1 (v2).md',
+        content: '# 架构',
+        images: [smallPngPath],
+      });
+      assert.equal(res.isError, undefined, textOf(res));
+      const doc = await fs.readFile(path.join(root, 'notes/架构笔记 #1 (v2).md'), 'utf8');
+      assert.match(doc, /!\[shot\]\(assets\/架构笔记%20%231%20%28v2%29-\d{8}-\d{6}-\d{3}\.png\)/);
+      const read = await call('read_file', { path: 'notes/架构笔记 #1 (v2).md' });
+      assert.equal(read.isError, undefined, textOf(read));
+      assert.equal(imagesOf(read).length, 1);
+      assert.equal(encodeImageSrc('定稿?v=1#top (a).png'), '定稿%3Fv=1%23top%20%28a%29.png');
+    });
+
+    await check('save_file with full-width space (U+3000) in filename encodes ref and read_file returns 1 image', async () => {
+      assert.equal(encodeImageSrc('a\u3000b.png'), 'a%E3%80%80b.png');
+      const res = await call('save_file', {
+        path: 'notes/全角\u3000空格.md',
+        content: '# 全角空格',
+        images: [smallPngPath],
+      });
+      assert.equal(res.isError, undefined, textOf(res));
+      const doc = await fs.readFile(path.join(root, 'notes/全角\u3000空格.md'), 'utf8');
+      assert.match(doc, /!\[shot\]\(assets\/全角%E3%80%80空格-\d{8}-\d{6}-\d{3}\.png\)/);
+      const read = await call('read_file', { path: 'notes/全角\u3000空格.md' });
+      assert.equal(read.isError, undefined, textOf(read));
+      assert.equal(imagesOf(read).length, 1);
+    });
+
+    await check('DNS rebinding guard (net-guard): single resolve, loopback rejected with 0 connections, allowed policy downloads', async () => {
+      let serverHits = 0;
+      let lastHeaders = {};
+      const guardServer = http.createServer((req, res) => {
+        serverHits += 1;
+        lastHeaders = req.headers;
+        if (req.url === '/shot.png') {
+          res.writeHead(200, { 'Content-Type': 'image/png' });
+          res.end(smallPng);
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      await new Promise((resolve) => guardServer.listen(0, '127.0.0.1', resolve));
+      const guardPort = guardServer.address().port;
+      try {
+        // 1. Default public-IP policy: resolver returning 127.0.0.1 is called
+        //    exactly ONCE, request is rejected, and server receives 0 connections.
+        let resolveCalls = 0;
+        await assert.rejects(
+          () =>
+            safeRequest(`http://rebind.example:${guardPort}/shot.png`, {
+              resolve: async () => {
+                resolveCalls += 1;
+                return [{ address: '127.0.0.1', family: 4 }];
+              },
+            }),
+          (err) => err instanceof BlockedUrlError && /127\.0\.0\.1 is not a public address/.test(err.reason),
+        );
+        assert.equal(resolveCalls, 1, 'resolver must be called exactly 1 time (no second DNS lookup)');
+        assert.equal(serverHits, 0, 'local server must receive 0 connections when blocked');
+
+        // 2. IPv6 literal http://[::1]/ is rejected at connection time with 0 connections.
+        await assert.rejects(
+          () => safeRequest(`http://[::1]:${guardPort}/shot.png`),
+          (err) => err instanceof BlockedUrlError && /::1 is not a public address/.test(err.reason),
+        );
+        assert.equal(serverHits, 0, 'local server must receive 0 connections on [::1]');
+
+        // 3. Injected allow policy: resolver called once, download succeeds,
+        //    Host and User-Agent/Accept headers set properly.
+        let allowResolveCalls = 0;
+        const acq = await acquireImage(
+          `http://rebind.example:${guardPort}/shot.png`,
+          undefined,
+          {
+            resolve: async () => {
+              allowResolveCalls += 1;
+              return [{ address: '127.0.0.1', family: 4 }];
+            },
+            isAllowedAddress: () => true,
+          },
+        );
+        assert.equal(acq.ok, true, acq.ok ? '' : acq.note);
+        assert.equal(allowResolveCalls, 1, 'resolver must be called exactly 1 time on allowed download');
+        assert.equal(serverHits, 1, 'local server must receive the 1 allowed request');
+        assert.ok(acq.image.data.equals(smallPng));
+        assert.equal(lastHeaders['host'], `rebind.example:${guardPort}`);
+        assert.match(String(lastHeaders['user-agent'] ?? ''), /memdrive-mcp/);
+        assert.equal(lastHeaders['accept'], 'image/*');
+        assert.equal(lastHeaders['accept-encoding'], undefined);
+
+        // 4. Download stream stops early when storedRemainingBytes is smaller than the image.
+        const smallStoredBudget = {
+          storedRemainingBytes: 10,
+          downloadRemainingBytes: 500_000_000,
+        };
+        const overStored = await acquireImage(
+          `http://rebind.example:${guardPort}/shot.png`,
+          smallStoredBudget,
+          {
+            resolve: async () => [{ address: '127.0.0.1', family: 4 }],
+            isAllowedAddress: () => true,
+          },
+        );
+        assert.equal(overStored.ok, false);
+        assert.match(overStored.note, /stored image budget/i);
+      } finally {
+        guardServer.close();
+      }
+    });
+
+    await check('save_file mode new pre-check rejects existing target before acquiring or writing images', async () => {
+      await call('save_file', { path: 'precheck/existing.md', content: '# V1', mode: 'new' });
+      const dup = await call('save_file', {
+        path: 'precheck/existing.md',
+        content: '# V2',
+        mode: 'new',
+        images: [smallPngPath],
+      });
+      assert.equal(dup.isError, true);
+      assert.match(textOf(dup), /already exists/i);
+      await assert.rejects(
+        fs.stat(path.join(root, 'precheck', 'assets')),
+        'assets/ must not be created when mode:new target already exists',
+      );
+    });
+
+    await check('atomicWrite & overwrite guarantees: mode preserved, symlink followed, read-only refused, retry, .mdtmp skipped', async () => {
+      // 1. Orphaned .mdtmp-* files are skipped by list_directory and search_files.
+      const orphanTmp = path.join(root, 'notes', '.mdtmp-orphan-999');
+      await fs.writeFile(orphanTmp, 'ORPHAN-TEMP-SECRET-KEYWORD');
+      const listRes = await call('list_directory', { path: 'notes' });
+      assert.doesNotMatch(textOf(listRes), /\.mdtmp-/);
+      const searchRes = await call('search_files', { keyword: 'ORPHAN-TEMP-SECRET-KEYWORD' });
+      assert.doesNotMatch(textOf(searchRes), /\.mdtmp-/);
+      await fs.unlink(orphanTmp);
+
+      // 2. Intra-root symlink is followed on overwrite (link stays a link, target updated).
+      const realNote = path.join(root, 'notes', 'real-target.md');
+      const linkNote = path.join(root, 'notes', 'sym-target.md');
+      await fs.writeFile(realNote, 'v1');
+      let canSymlink = true;
+      try {
+        await fs.symlink(realNote, linkNote, 'file');
+      } catch (err) {
+        if (err.code === 'EPERM' || err.code === 'EACCES') {
+          canSymlink = false;
+        } else {
+          throw err;
+        }
+      }
+      if (canSymlink) {
+        const overSym = await call('save_file', {
+          path: 'notes/sym-target.md',
+          content: 'v2-through-link',
+          mode: 'overwrite',
+        });
+        assert.equal(overSym.isError, undefined, textOf(overSym));
+        assert.equal((await fs.lstat(linkNote)).isSymbolicLink(), true, 'symlink must not be replaced by a regular file');
+        assert.equal(await fs.readFile(realNote, 'utf8'), 'v2-through-link');
+      }
+
+      // 3. Mode preservation (0o600) and read-only refusal (0o444) on POSIX.
+      if (process.platform !== 'win32') {
+        const modeFile = path.join(root, 'notes', 'secret-mode.md');
+        await fs.writeFile(modeFile, 'initial', { mode: 0o600 });
+        await fs.chmod(modeFile, 0o600);
+        const overMode = await call('save_file', {
+          path: 'notes/secret-mode.md',
+          content: 'updated-600',
+          mode: 'overwrite',
+        });
+        assert.equal(overMode.isError, undefined, textOf(overMode));
+        assert.equal(((await fs.stat(modeFile)).mode & 0o777), 0o600, '0o600 mode must be preserved after overwrite');
+
+        if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+          const roFile = path.join(root, 'notes', 'readonly.md');
+          await fs.writeFile(roFile, 'locked');
+          await fs.chmod(roFile, 0o444);
+          try {
+            const overRo = await call('save_file', {
+              path: 'notes/readonly.md',
+              content: 'try-write',
+              mode: 'overwrite',
+            });
+            assert.equal(overRo.isError, true);
+            assert.match(textOf(overRo), /File is read-only/i);
+            assert.doesNotMatch(textOf(overRo), /Unexpected error/i);
+            assert.equal(await fs.readFile(roFile, 'utf8'), 'locked');
+            await assert.rejects(
+              () => atomicWrite(roFile, 'try-direct'),
+              (err) => err.name === 'MemDriveError' && err.code === 'READ_ONLY',
+            );
+          } finally {
+            await fs.chmod(roFile, 0o644).catch(() => undefined);
+          }
+        }
+      }
+
+      // 4. Rename retry on transient EBUSY/EPERM.
+      const retryTarget = path.join(root, 'notes', 'retry-test.md');
+      let renameAttempts = 0;
+      const retryRes = await atomicWrite(retryTarget, 'retried-ok', {
+        fs: {
+          rename: async (src, dest) => {
+            renameAttempts += 1;
+            if (renameAttempts < 3) {
+              const err = new Error('busy');
+              err.code = 'EBUSY';
+              throw err;
+            }
+            return fs.rename(src, dest);
+          },
+        },
+      });
+      assert.equal(retryRes.existed, false);
+      assert.equal(renameAttempts, 3);
+      assert.equal(await fs.readFile(retryTarget, 'utf8'), 'retried-ok');
+    });
+
+    await check('extensionForMime and mimeFromExtension ignore Object.prototype properties', async () => {
+      assert.equal(extensionForMime('constructor'), 'png');
+      assert.equal(extensionForMime('__proto__'), 'png');
+      assert.equal(extensionForMime('toString'), 'png');
+      assert.equal(mimeFromExtension('file.constructor'), null);
+      assert.equal(mimeFromExtension('file.__proto__'), null);
+      assert.equal(detectImageMime(Buffer.from('BM25 is a ranking function')), null);
+      assert.equal(detectImageMime(Buffer.from('GIF89a is text, Wait: GIF89a header is 6 bytes')), 'image/gif');
+      assert.equal(detectImageMime(Buffer.from('GIF800 not a gif')), null);
+    });
+
+    await check('acquireImage refuses without fetching when either budget is exhausted', async () => {
+      // 0.7.0 follow-up (#4, partial): the pre-checks refuse before
+      // any fetch, so they are testable offline. The full
+      // "failed download does not consume stored budget" path has
+      // no public endpoint in this suite and is not covered here.
+      const noStored = await acquireImage('http://example.com/x.png', {
+        storedRemainingBytes: 0,
+        downloadRemainingBytes: 500_000_000,
+      });
+      assert.equal(noStored.ok, false);
+      assert.match(noStored.note, /stored image budget/i);
+      const noDownload = await acquireImage('http://example.com/x.png', {
+        storedRemainingBytes: 500_000_000,
+        downloadRemainingBytes: 0,
+      });
+      assert.equal(noDownload.ok, false);
+      assert.match(noDownload.note, /download limit/i);
     });
 
     await check('save_file with quoted + backslash path is cleaned', async () => {
@@ -472,6 +907,32 @@ async function main() {
       const res = await call('read_file', { path: 'link-file.txt' });
       assert.equal(res.isError, true);
       assert.match(textOf(res), /symlink/i);
+    });
+
+    await check('search_files never leaks content through a symlink to an outside file', async () => {
+      // Regression test for the 0.7.0 search_files symlink hole: the
+      // search walk used to follow a symlink to a small outside text
+      // file, read its content, and return its matching line as an
+      // excerpt. The outside file holds 'TOP-SECRET-OUTSIDE-ROOT',
+      // a string that occurs nowhere inside the root.
+      try {
+        await fs.symlink(path.join(outside, 'secret.txt'), path.join(root, 'search-link.txt'), 'file');
+      } catch (error) {
+        // Windows without symlink privilege (EPERM): creating a file
+        // symlink is an environment limitation, not a server defect.
+        // Skip this check rather than false-failing.
+        if (error.code === 'EPERM' || error.code === 'EACCES') {
+          console.log('  (skipped: no privilege to create a file symlink on this machine)');
+          return;
+        }
+        throw error;
+      }
+      const res = await call('search_files', { keyword: 'TOP-SECRET-OUTSIDE-ROOT' });
+      assert.equal(res.isError, undefined, textOf(res));
+      const text = textOf(res);
+      assert.match(text, /No files matching/);
+      assert.doesNotMatch(text, /search-link\.txt/);
+      assert.doesNotMatch(text, /link-file\.txt/);
     });
 
     await check('clipboard: graceful on every outcome, text saved, server alive', async () => {
@@ -853,7 +1314,10 @@ async function main() {
       });
       // A hostile filename (spaces, semicolon, shell metacharacters)
       // stays ONE array element: it is never concatenated into a
-      // command line, so it cannot inject a second command.
+      // command line by this code. That alone does NOT make it safe
+      // on Windows — cmd.exe re-parses the line, so & | < > ^ %
+      // would still split it (see the launchViewer refusal test
+      // below); the array shape only rules out naive concatenation.
       const hostile = '/tmp/a b; rm -rf /x.png';
       const cmd = viewerCommandFor('linux', hostile);
       assert.equal(cmd.args.length, 1);
@@ -888,6 +1352,21 @@ async function main() {
       const winCmd = folderCommandFor('win32', hostileWin);
       assert.equal(winCmd.args.length, 5);
       assert.equal(winCmd.args[4], '/n,' + hostileWin);
+    });
+
+    await check('openInViewer/openFolderInViewer refuse Windows shell metacharacters without spawning', async () => {
+      // 0.7.0 follow-up (#9): on win32 the path is re-parsed by
+      // cmd.exe, so & | < > ^ % would split the command line.
+      // The refusal happens before any spawn, so this runs on any
+      // platform by passing 'win32' explicitly.
+      const file = await openInViewer('C:\\x&calc&.png', 'win32');
+      assert.equal(file.ok, false);
+      assert.match(file.reason, /metacharacters/i);
+      const folder = await openFolderInViewer('C:\\x&calc&', 'win32');
+      assert.equal(folder.ok, false);
+      assert.match(folder.reason, /metacharacters/i);
+      const pipe = await openInViewer('C:\\a|b.png', 'win32');
+      assert.equal(pipe.ok, false);
     });
 
     await check('probeCandidateRoots (Linux fake): existing OneDrive + always-listed default', async () => {

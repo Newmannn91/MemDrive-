@@ -50,6 +50,7 @@ import {
   type HostConfigAdapter,
   type HostConfigEntry,
   type HostProbeDeps,
+  type WriteConfigResult,
 } from './host-config.js';
 
 const execFileAsync = promisify(execFile);
@@ -258,9 +259,13 @@ export function expandCustomPath(
     return homeDir;
   }
   if (p.startsWith('~/') || p.startsWith('~\\')) {
-    p = pathMod.join(homeDir, p.slice(2));
+    const tail = platform === 'win32' ? p.slice(2) : p.slice(2).replace(/\\/g, '/');
+    p = pathMod.join(homeDir, tail);
   }
   if (!pathMod.isAbsolute(p)) {
+    return null;
+  }
+  if (platform === 'win32' && !/^(?:[a-zA-Z]:[\\/]|\\\\)/.test(p)) {
     return null;
   }
   return pathMod.normalize(p);
@@ -494,7 +499,21 @@ export async function runSetupWizard(
     }
 
     if (configPath !== undefined) {
-      const result = await writeHostConfig(adapter, configPath, entry);
+      let result: WriteConfigResult;
+      try {
+        result = await writeHostConfig(adapter, configPath, entry);
+      } catch (error) {
+        // A throw (for example a config file locked by a sync
+        // client on Windows) used to fall through to the outer
+        // catch, which printed only 'Setup stopped: ...' and no
+        // way forward. Show the manual snippet instead.
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(`\nCould not update the ${adapter.displayName} config: ${message}`);
+        console.log('Nothing was changed. Fix the config file, then run setup again.');
+        console.log('\nManual snippet for now:');
+        console.log(configSnippet(rootPath, adapter));
+        return 1;
+      }
       if (result.status === 'written') {
         console.log(`\n${adapter.displayName} config updated: ${result.configPath}`);
         console.log(`Backup saved as: ${result.backupPath}`);

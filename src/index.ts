@@ -6,10 +6,7 @@
  * protocol traffic may be written there. Diagnostics go to stderr.
  *
  * Storage is local-filesystem only. The tools talk to a
- * StorageBackend interface; WebDAV is interface-reserved behind
- * the StorageBackend interface but not implemented. Whether it is
- * implemented later depends on user feedback, and it will only be
- * considered if the user base is large with clear demand.
+ * StorageBackend interface.
  */
 import fs from 'node:fs/promises';
 
@@ -21,7 +18,7 @@ import { LocalStorageBackend } from './storage.js';
 import { registerTools } from './tools.js';
 import { runSetupWizard } from './wizard.js';
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 
 async function main(): Promise<void> {
   // `node dist/index.js setup` runs the interactive setup wizard

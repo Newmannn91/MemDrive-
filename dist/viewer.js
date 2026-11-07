@@ -4,9 +4,13 @@
  *
  * The viewer command is built as an argument array and launched with
  * `execFile` — never as a shell string, and the file path is never
- * concatenated into a command line, so a crafted filename cannot
- * inject a second command. Only one viewer command per platform is
- * ever used, and there is no environment-variable override for it
+ * concatenated into a command line. That alone does NOT make a
+ * crafted filename safe on Windows: cmd.exe re-parses the line, so
+ * a path containing & | < > ^ % would split it into a second
+ * command (libuv only quotes arguments holding a space, tab, or
+ * quote). `launchViewer` therefore refuses such paths on win32
+ * before spawning. Only one viewer command per platform is ever
+ * used, and there is no environment-variable override for it
  * (an override would be an arbitrary-execution footgun: any caller
  * able to set the variable could run anything).
  *
@@ -105,7 +109,7 @@ export const VIEWER_LAUNCH_TIMEOUT_MS = 10_000;
  */
 export async function openInViewer(absolutePath, platform = process.platform) {
     const { command, args } = viewerCommandFor(platform, absolutePath);
-    return launchViewer(command, args);
+    return launchViewer(command, args, absolutePath, platform);
 }
 /**
  * Launch the OS file manager for the folder `absolutePath` (folder
@@ -116,9 +120,22 @@ export async function openInViewer(absolutePath, platform = process.platform) {
  */
 export async function openFolderInViewer(absolutePath, platform = process.platform) {
     const { command, args } = folderCommandFor(platform, absolutePath);
-    return launchViewer(command, args);
+    return launchViewer(command, args, absolutePath, platform);
 }
-async function launchViewer(command, args) {
+async function launchViewer(command, args, absolutePath, platform) {
+    // On Windows the path is re-parsed by cmd.exe, so a filename
+    // containing & | < > ^ % would split the command line and run a
+    // second command. (The header comment's "a crafted filename
+    // cannot inject a second command" is only true where no shell
+    // re-parses the line; cmd.exe does.) Refuse instead of launching.
+    // NOTE: this is a refusal, not a new launch mechanism — switching
+    // away from cmd entirely is a follow-up, not this round.
+    if (platform === 'win32' && /[&|<>^%]/.test(absolutePath)) {
+        return {
+            ok: false,
+            reason: `Refusing to open a path containing shell metacharacters (& | < > ^ %) on Windows: ${absolutePath}`,
+        };
+    }
     return new Promise((resolve) => {
         let settled = false;
         const settle = (result) => {

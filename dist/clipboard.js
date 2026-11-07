@@ -100,8 +100,14 @@ async function readMacOs() {
     catch {
         // No image on the clipboard (or no GUI session): fall back to text.
         try {
-            const text = await runText('osascript', ['-e', 'return the clipboard']);
-            if (text !== null) {
+            const { stdout } = await execFileAsync('osascript', ['-e', 'return the clipboard'], {
+                encoding: 'utf8',
+                maxBuffer: CLIPBOARD_MAX_BYTES,
+                timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
+                windowsHide: true,
+            });
+            const text = stdout.trim();
+            if (text.length > 0) {
                 return { kind: 'text', text };
             }
             return { kind: 'empty' };

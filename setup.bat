@@ -16,13 +16,13 @@ REM parenthesized blocks and of parentheses inside quoted text.
 setlocal
 cd /d "%~dp0"
 
-REM 1. Node.js must be installed. MemDrive needs Node 18 or newer.
+REM 1. Node.js must be installed. MemDrive needs Node 24 or newer.
 where node >nul 2>nul
 if errorlevel 1 goto :missing_node
 node -v
 for /f "tokens=1 delims=v." %%a in ('node -v') do set "NODEMAJOR=%%a"
 if not defined NODEMAJOR goto :old_node
-if %NODEMAJOR% LSS 18 goto :old_node
+if %NODEMAJOR% LSS 24 goto :old_node
 
 REM 2. Install dependencies and build. Failures are shown plainly
 REM and stop the script; nothing is written to any app config yet.
@@ -44,7 +44,7 @@ exit /b 0
 :missing_node
 echo.
 echo Node.js is not installed on this computer.
-echo MemDrive needs Node.js 18 or newer. Download it from the
+echo MemDrive needs Node.js 24 or newer. Download it from the
 echo official site, a free download, install it, then run setup.bat again.
 echo.
 set /p OPENBROWSER=Open https://nodejs.org in your browser now? Y/N:
@@ -54,7 +54,7 @@ exit /b 1
 
 :old_node
 echo.
-echo Node.js 18 or newer is required. Please update Node.js, then run setup.bat again.
+echo Node.js 24 or newer is required. Please update Node.js, then run setup.bat again.
 echo Setup stopped. Nothing was changed.
 exit /b 1
 

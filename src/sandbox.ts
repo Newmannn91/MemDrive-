@@ -39,14 +39,14 @@ export function cleanPath(input: string): string {
     }
     break;
   }
-  if (p === '~') {
-    return homedir();
-  }
-  if (p.startsWith('~/') || p.startsWith('~\\')) {
-    return path.join(homedir(), p.slice(2));
-  }
   // Normalize Windows-style separators so `a\b` and `a/b` mean the same.
   const unified = p.replace(/\\/g, '/');
+  if (unified === '~') {
+    return homedir();
+  }
+  if (unified.startsWith('~/')) {
+    return path.join(homedir(), unified.slice(2));
+  }
   return path.normalize(unified);
 }
 
@@ -80,7 +80,10 @@ export function resolveInRoot(rootDir: string, input: string): string {
  * yet: walk up to the nearest existing ancestor, realpath it, then re-join
  * the remaining segments.
  */
-async function realLocation(absolutePath: string): Promise<string> {
+async function realLocation(absolutePath: string, depth = 0): Promise<string> {
+  if (depth > 32) {
+    throw new SandboxError(`Too many levels of symbolic links: ${absolutePath}`);
+  }
   const missing: string[] = [];
   let current = absolutePath;
   for (;;) {
@@ -95,6 +98,26 @@ async function realLocation(absolutePath: string): Promise<string> {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'ENOENT' && code !== 'ENOTDIR') {
         throw error;
+      }
+      if (code === 'ENOENT') {
+        try {
+          const lst = await fs.lstat(current);
+          if (lst.isSymbolicLink()) {
+            const linkTarget = await fs.readlink(current);
+            const resolvedLink = path.resolve(path.dirname(current), linkTarget);
+            const realTarget = await realLocation(resolvedLink, depth + 1);
+            let result = realTarget;
+            for (let i = missing.length - 1; i >= 0; i -= 1) {
+              result = path.join(result, missing[i] as string);
+            }
+            return result;
+          }
+        } catch (linkError) {
+          if (linkError instanceof SandboxError) {
+            throw linkError;
+          }
+          // Not an existing symlink; continue walking up to parent.
+        }
       }
       const parent = path.dirname(current);
       if (parent === current) {

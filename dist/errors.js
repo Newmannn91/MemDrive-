@@ -25,10 +25,3 @@ export class NotFoundError extends MemDriveError {
         this.name = 'NotFoundError';
     }
 }
-/** Raised when an image cannot be decoded, captured, or downloaded. */
-export class ImageError extends MemDriveError {
-    constructor(message) {
-        super('IMAGE_ERROR', message);
-        this.name = 'ImageError';
-    }
-}

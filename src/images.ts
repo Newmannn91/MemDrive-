@@ -15,6 +15,7 @@
  * and reported with a note when over it — never crashed on.
  */
 import fs from 'node:fs/promises';
+import type http from 'node:http';
 import path from 'node:path';
 
 import { Jimp } from 'jimp';
@@ -27,10 +28,22 @@ import {
   IMAGE_PREVIEW_QUALITIES,
   IMAGE_PREVIEW_QUALITY,
   IMAGE_PREVIEW_SCALE_STEP,
+  SAVE_IMAGES_MAX_DOWNLOAD_BYTES,
+  SAVE_IMAGES_MAX_TOTAL_BYTES,
   URL_DOWNLOAD_MAX_BYTES,
   URL_DOWNLOAD_TIMEOUT_MS,
 } from './config.js';
+import {
+  BlockedUrlError,
+  blockedUrlReason,
+  isPublicIp,
+  precheckUrlReason,
+  safeRequest,
+  type SafeRequestOptions,
+} from './net-guard.js';
 import { cleanPath } from './sandbox.js';
+
+export { blockedUrlReason, isPublicIp, safeRequest, type SafeRequestOptions };
 
 export interface AcquiredImage {
   data: Buffer;
@@ -42,6 +55,31 @@ export interface AcquiredImage {
 export type ImageAcquisition =
   | { ok: true; image: AcquiredImage }
   | { ok: false; note: string };
+
+/**
+ * Per-save image byte budgets, shared across every image of one
+ * save_file call. Mutated as images are acquired; when one runs
+ * out, further images are refused with a note instead of failing
+ * the save. Two counters: `storedRemainingBytes` bounds the bytes
+ * actually kept (URL downloads confirmed as images, local copies,
+ * clipboard images), while `downloadRemainingBytes` bounds the
+ * bytes fetched from URLs. A failed or non-image download spends
+ * download traffic, never stored budget.
+ */
+export interface ImageSaveBudget {
+  storedRemainingBytes: number;
+  downloadRemainingBytes: number;
+}
+
+/** Reason text when the per-save stored-image budget is hit. */
+function storedBudgetNote(): string {
+  return `stored image budget for this save (${SAVE_IMAGES_MAX_TOTAL_BYTES / 1_000_000} MB) was reached`;
+}
+
+/** Reason text when the per-save download-traffic budget is hit. */
+function downloadBudgetNote(): string {
+  return `download limit for this save (${SAVE_IMAGES_MAX_DOWNLOAD_BYTES / 1_000_000} MB) was reached`;
+}
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   '.png': 'image/png',
@@ -64,12 +102,15 @@ const EXTENSION_BY_MIME: Record<string, string> = {
 };
 
 export function mimeFromExtension(filePath: string): string | null {
-  return MIME_BY_EXTENSION[path.extname(filePath).toLowerCase()] ?? null;
+  const ext = path.extname(filePath).toLowerCase();
+  return Object.hasOwn(MIME_BY_EXTENSION, ext) ? (MIME_BY_EXTENSION[ext] ?? null) : null;
 }
 
 export function extensionForMime(mimeType: string): string {
-  return EXTENSION_BY_MIME[mimeType] ?? 'png';
+  return Object.hasOwn(EXTENSION_BY_MIME, mimeType) ? (EXTENSION_BY_MIME[mimeType] ?? 'png') : 'png';
 }
+
+const BMP_HEADER_SIZES = new Set([12, 40, 52, 56, 64, 108, 124]);
 
 /** Detect an image MIME type from magic bytes; null when not an image. */
 export function detectImageMime(data: Buffer): string | null {
@@ -79,10 +120,19 @@ export function detectImageMime(data: Buffer): string | null {
   if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
     return 'image/jpeg';
   }
-  if (data.length >= 6 && data.subarray(0, 6).toString('ascii').startsWith('GIF8')) {
-    return 'image/gif';
+  if (data.length >= 6) {
+    const gifHead = data.subarray(0, 6).toString('ascii');
+    if (gifHead === 'GIF87a' || gifHead === 'GIF89a') {
+      return 'image/gif';
+    }
   }
-  if (data.length >= 2 && data[0] === 0x42 && data[1] === 0x4d) {
+  if (
+    data.length >= 18 &&
+    data[0] === 0x42 &&
+    data[1] === 0x4d &&
+    data.readUInt32LE(6) === 0 &&
+    BMP_HEADER_SIZES.has(data.readUInt32LE(14))
+  ) {
     return 'image/bmp';
   }
   if (
@@ -104,59 +154,167 @@ export function detectImageMime(data: Buffer): string | null {
 
 function baseNameOf(filePath: string): string {
   const base = path.basename(filePath, path.extname(filePath));
-  const cleaned = base.replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-');
+  const cleaned = base.replace(/[^\p{L}\p{N}_\- ]+/gu, '').trim().replace(/\s+/g, '-');
   return cleaned.length > 0 ? cleaned : 'image';
 }
 
+/** Redirect statuses HTTP(S) downloads follow; anything else is a final answer. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Maximum redirects followed for one image URL. */
+const MAX_REDIRECTS = 5;
+
 /** Download an image URL, streaming to memory with a safety ceiling. */
-async function downloadImage(url: string): Promise<ImageAcquisition> {
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      signal: AbortSignal.timeout(URL_DOWNLOAD_TIMEOUT_MS),
-      redirect: 'follow',
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, note: `Could not download image URL ${url}: ${message}` };
+async function downloadImage(
+  url: string,
+  budget?: ImageSaveBudget,
+  netOpts?: SafeRequestOptions,
+): Promise<ImageAcquisition> {
+  // Either per-save counter exhausted refuses the fetch outright:
+  // no download traffic is spent and no stored budget is needed.
+  if (budget !== undefined && budget.downloadRemainingBytes <= 0) {
+    return { ok: false, note: `${downloadBudgetNote()}.` };
   }
-  if (!response.ok || response.body === null) {
+  if (budget !== undefined && budget.storedRemainingBytes <= 0) {
+    return { ok: false, note: `${storedBudgetNote()}.` };
+  }
+  // One deadline for the whole redirect chain and body stream.
+  const timeout = AbortSignal.timeout(URL_DOWNLOAD_TIMEOUT_MS);
+  let current = url;
+  let response: http.IncomingMessage | null = null;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    // Layer 1 (pre-check): URL syntax, scheme, localhost, and IP literals.
+    // Layer 2 (authoritative connection-time check in safeRequest):
+    // single DNS resolution in custom `lookup` with `agent: false`.
+    const blocked = precheckUrlReason(
+      current,
+      netOpts?.isAllowedAddress ?? isPublicIp,
+    );
+    if (blocked !== null) {
+      return { ok: false, note: `Refusing image URL ${url}: ${blocked}.` };
+    }
+    try {
+      response = await safeRequest(current, {
+        ...netOpts,
+        signal: timeout,
+      });
+    } catch (error) {
+      if (error instanceof BlockedUrlError) {
+        return { ok: false, note: `Refusing image URL ${url}: ${error.reason}.` };
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, note: `Could not download image URL ${url}: ${message}` };
+    }
+    const status = response.statusCode ?? 0;
+    if (REDIRECT_STATUSES.has(status)) {
+      const locationHeader = response.headers.location;
+      const location = Array.isArray(locationHeader)
+        ? locationHeader[0]
+        : locationHeader;
+      response.destroy();
+      response = null;
+      if (location === undefined || location === '') {
+        return {
+          ok: false,
+          note: `Could not download image URL ${url}: redirect without a location.`,
+        };
+      }
+      if (hop === MAX_REDIRECTS) {
+        return {
+          ok: false,
+          note: `Image URL ${url} exceeds the ${MAX_REDIRECTS} redirect limit.`,
+        };
+      }
+      try {
+        current = new URL(location, current).toString();
+      } catch {
+        return {
+          ok: false,
+          note: `Could not download image URL ${url}: redirect to an invalid URL.`,
+        };
+      }
+      continue;
+    }
+    break;
+  }
+  if (response === null) {
+    return { ok: false, note: `Could not download image URL ${url}.` };
+  }
+  const status = response.statusCode ?? 0;
+  if (status < 200 || status >= 300) {
+    response.destroy();
     return {
       ok: false,
-      note: `Could not download image URL ${url}: HTTP ${response.status}`,
+      note: `Could not download image URL ${url}: HTTP ${status}`,
     };
   }
   const chunks: Buffer[] = [];
   let total = 0;
+  // The stream stops at whichever ceiling is lowest: the per-download
+  // ceiling, the remaining download-traffic budget, or the remaining
+  // stored-image budget (so an image too large to store is aborted
+  // immediately instead of downloaded in full first).
+  const downloadCap = budget?.downloadRemainingBytes ?? URL_DOWNLOAD_MAX_BYTES;
+  const storedCap = budget?.storedRemainingBytes ?? URL_DOWNLOAD_MAX_BYTES;
+  const ceiling = Math.min(URL_DOWNLOAD_MAX_BYTES, downloadCap, storedCap);
   try {
-    const reader = response.body.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+    for await (const chunk of response) {
+      const buf = chunk as Buffer;
+      total += buf.byteLength;
+      if (budget !== undefined) {
+        budget.downloadRemainingBytes = Math.max(
+          0,
+          budget.downloadRemainingBytes - buf.byteLength,
+        );
       }
-      total += value.byteLength;
-      if (total > URL_DOWNLOAD_MAX_BYTES) {
-        await reader.cancel().catch(() => undefined);
+      if (total > ceiling) {
+        response.destroy();
+        if (budget !== undefined && ceiling < URL_DOWNLOAD_MAX_BYTES) {
+          return {
+            ok: false,
+            note:
+              downloadCap <= storedCap
+                ? `${downloadBudgetNote()}.`
+                : `${storedBudgetNote()}.`,
+          };
+        }
         return {
           ok: false,
           note: `Image URL ${url} exceeds the ${URL_DOWNLOAD_MAX_BYTES} byte download safety ceiling.`,
         };
       }
-      chunks.push(Buffer.from(value));
+      chunks.push(buf);
     }
   } catch (error) {
+    response.destroy();
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, note: `Download of image URL ${url} failed: ${message}` };
   }
   const data = Buffer.concat(chunks);
-  const headerType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
-  const mimeType = detectImageMime(data) ?? (headerType?.startsWith('image/') ? headerType : null);
+  const rawContentType = response.headers['content-type'];
+  const contentTypeStr = Array.isArray(rawContentType)
+    ? rawContentType[0]
+    : rawContentType;
+  const headerType = contentTypeStr?.split(';')[0]?.trim().toLowerCase();
+  const mimeType =
+    detectImageMime(data) ??
+    (headerType !== undefined && Object.hasOwn(EXTENSION_BY_MIME, headerType)
+      ? headerType
+      : null);
   if (mimeType === null) {
     return {
       ok: false,
       note: `URL ${url} did not return image data (content-type: ${headerType ?? 'unknown'}).`,
     };
+  }
+  // Only now, with a confirmed image, does the stored budget move:
+  // a failed or non-image download has already spent traffic, but
+  // must not block later legitimate images.
+  if (budget !== undefined && data.length > budget.storedRemainingBytes) {
+    return { ok: false, note: `${storedBudgetNote()}.` };
+  }
+  if (budget !== undefined) {
+    budget.storedRemainingBytes = Math.max(0, budget.storedRemainingBytes - data.length);
   }
   let stem = 'image';
   try {
@@ -168,11 +326,31 @@ async function downloadImage(url: string): Promise<ImageAcquisition> {
 }
 
 /** Copy an image from a local OS path (outside the sandbox root is fine). */
-async function copyLocalImage(spec: string): Promise<ImageAcquisition> {
+async function copyLocalImage(spec: string, budget?: ImageSaveBudget): Promise<ImageAcquisition> {
   const cleaned = cleanPath(spec);
   const absolute = path.isAbsolute(cleaned)
     ? path.resolve(cleaned)
     : path.resolve(process.cwd(), cleaned);
+  // Refuse non-regular files outright: /dev/zero, FIFOs, and device
+  // nodes report size 0, so a size check alone cannot stop an
+  // unbounded read — and readFile on them never returns. A stat
+  // failure is reported directly instead of falling through to a
+  // read that would report a different, misleading error.
+  let st: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    st = await fs.stat(absolute);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, note: `Could not read local image ${spec}: ${message}` };
+  }
+  if (!st.isFile()) {
+    return { ok: false, note: `Not a regular file: ${spec}` };
+  }
+  // A local file that alone would exhaust the save's stored budget is
+  // refused without reading it.
+  if (budget !== undefined && st.size > budget.storedRemainingBytes) {
+    return { ok: false, note: `${storedBudgetNote()}.` };
+  }
   let data: Buffer;
   try {
     data = await fs.readFile(absolute);
@@ -180,12 +358,25 @@ async function copyLocalImage(spec: string): Promise<ImageAcquisition> {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, note: `Could not read local image ${spec}: ${message}` };
   }
-  const mimeType = detectImageMime(data) ?? mimeFromExtension(absolute);
+  // The file may have grown between stat and read; re-check after read.
+  if (budget !== undefined && data.length > budget.storedRemainingBytes) {
+    return { ok: false, note: `${storedBudgetNote()}.` };
+  }
+  const extMime = mimeFromExtension(absolute);
+  const mimeType =
+    extMime !== null
+      ? (detectImageMime(data) ?? extMime)
+      : path.extname(absolute) === ''
+        ? detectImageMime(data)
+        : null;
   if (mimeType === null) {
     return {
       ok: false,
       note: `File ${spec} does not look like an image (unrecognized format).`,
     };
+  }
+  if (budget !== undefined) {
+    budget.storedRemainingBytes = Math.max(0, budget.storedRemainingBytes - data.length);
   }
   return { ok: true, image: { data, mimeType, baseName: baseNameOf(absolute) } };
 }
@@ -195,11 +386,21 @@ async function copyLocalImage(spec: string): Promise<ImageAcquisition> {
  * http(s) URL, or a local file path. Never throws for expected failures;
  * returns a note instead so the caller can save the text and report.
  */
-export async function acquireImage(spec: string): Promise<ImageAcquisition> {
+export async function acquireImage(
+  spec: string,
+  budget?: ImageSaveBudget,
+  netOpts?: SafeRequestOptions,
+): Promise<ImageAcquisition> {
   const trimmed = spec.trim();
   if (trimmed === 'clipboard') {
     const result = await readClipboardImage();
     if (result.kind === 'image') {
+      if (budget !== undefined && result.data.length > budget.storedRemainingBytes) {
+        return { ok: false, note: `${storedBudgetNote()}.` };
+      }
+      if (budget !== undefined) {
+        budget.storedRemainingBytes = Math.max(0, budget.storedRemainingBytes - result.data.length);
+      }
       return {
         ok: true,
         image: { data: result.data, mimeType: result.mimeType, baseName: 'clipboard' },
@@ -220,9 +421,9 @@ export async function acquireImage(spec: string): Promise<ImageAcquisition> {
     return { ok: false, note: result.reason };
   }
   if (/^https?:\/\//i.test(trimmed)) {
-    return downloadImage(trimmed);
+    return downloadImage(trimmed, budget, netOpts);
   }
-  return copyLocalImage(trimmed);
+  return copyLocalImage(trimmed, budget);
 }
 
 /** Base64 length (bytes) of `byteLength` binary bytes: ceil(n/3)*4. */
@@ -337,11 +538,36 @@ export interface MarkdownImageRef {
  * `<img src="...">`. Remote URLs (http/https), data: URIs, and fragments
  * are skipped — only files that could live next to the document.
  */
+/**
+ * Percent-encode characters in a Markdown image src that would break
+ * the inline scan regex below (ASCII and non-ASCII whitespace, BOM,
+ * parentheses), be parsed by Markdown renderers as a URL fragment or
+ * query string ('#', '?'), or collide with percent-decoding ('%'),
+ * while keeping non-whitespace CJK characters directly readable in
+ * the note. Only newly saved notes carry encoded refs; pre-existing
+ * notes with unencoded refs are unchanged.
+ */
+export function encodeImageSrc(src: string): string {
+  return src.replace(/[\s\uFEFF\x00-\x1f\x7f%()#?<>\[\]"'`\\]/g, (ch) => {
+    const code = ch.codePointAt(0)!;
+    return code < 0x80
+      ? `%${code.toString(16).toUpperCase().padStart(2, '0')}`
+      : encodeURIComponent(ch);
+  });
+}
+
 export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
   const refs: MarkdownImageRef[] = [];
   const seen = new Set<string>();
   const push = (src: string): void => {
-    const trimmed = src.trim();
+    let trimmed = src.trim();
+    // Newly saved notes carry percent-encoded refs; decode them back
+    // to the on-disk path. A bad escape falls back to the raw src.
+    try {
+      trimmed = decodeURIComponent(trimmed);
+    } catch {
+      // Keep the raw src.
+    }
     if (
       trimmed.length === 0 ||
       seen.has(trimmed) ||
@@ -370,4 +596,3 @@ export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
   }
   return refs;
 }
-

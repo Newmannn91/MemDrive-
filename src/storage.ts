@@ -3,17 +3,22 @@
  *
  * The tools talk only to the `StorageBackend` interface, using root-relative
  * POSIX-style paths ('' means the root itself). This MVP ships one backend,
- * `LocalStorageBackend` (plain filesystem). A WebDAV backend can be added
- * later by implementing the same interface — no tool code changes.
+ * `LocalStorageBackend` (plain filesystem). Local only, by design.
  *
  * The backend performs NO sandbox checks: callers must validate paths with
  * the sandbox module before calling in. The backend trusts its inputs.
+ * The one exception is `search`: the walk discovers entries the caller
+ * never validated, so it skips any entry whose real location escapes the
+ * root (a symlink inside the root pointing outside it) instead of
+ * reading its content.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+import { atomicWrite } from './atomic.js';
 import { SEARCH_CONTENT_MAX_BYTES } from './config.js';
 import { MemDriveError } from './errors.js';
+import { assertInsideRealRoot, isInside } from './sandbox.js';
 
 export interface DirEntry {
   /** Entry name (no path separators). */
@@ -81,22 +86,27 @@ export class LocalStorageBackend implements StorageBackend {
     const dirents = await fs.readdir(dirAbs, { withFileTypes: true });
     const entries: DirEntry[] = [];
     for (const dirent of dirents) {
-      const entryAbs = path.join(dirAbs, dirent.name);
-      let size = 0;
-      let modifiedAt = '';
-      try {
-        const st = await fs.stat(entryAbs);
-        size = st.isDirectory() ? 0 : st.size;
-        modifiedAt = st.mtime.toISOString();
-      } catch {
-        // Entry vanished between readdir and stat; skip its metadata.
+      // Skip orphaned atomic-write temp files: a crash between
+      // write and rename leaves `.mdtmp-<pid>-<n>` behind, and it
+      // must never be listed (or searched) as a note.
+      if (dirent.name.startsWith('.mdtmp-')) {
+        continue;
       }
+      const entryAbs = path.join(dirAbs, dirent.name);
+      let st: Awaited<ReturnType<typeof fs.stat>>;
+      try {
+        st = await fs.stat(entryAbs);
+      } catch {
+        // Entry vanished between readdir and stat (or broken symlink); skip it.
+        continue;
+      }
+      const isDir = st.isDirectory();
       entries.push({
         name: dirent.name,
         relPath: (relDir === '' ? '' : `${relDir}/`) + dirent.name,
-        type: dirent.isDirectory() ? 'directory' : 'file',
-        size,
-        modifiedAt,
+        type: isDir ? 'directory' : 'file',
+        size: isDir ? 0 : st.size,
+        modifiedAt: st.mtime.toISOString(),
       });
     }
     entries.sort((a, b) => {
@@ -140,6 +150,13 @@ export class LocalStorageBackend implements StorageBackend {
     mode: WriteMode,
   ): Promise<{ created: boolean }> {
     const target = this.absolute(relPath);
+    let rootRealDir: string;
+    try {
+      rootRealDir = await fs.realpath(this.rootDir);
+    } catch {
+      rootRealDir = this.rootDir;
+    }
+    await assertInsideRealRoot(rootRealDir, target);
     await fs.mkdir(path.dirname(target), { recursive: true });
     if (mode === 'new') {
       try {
@@ -165,8 +182,13 @@ export class LocalStorageBackend implements StorageBackend {
       await fs.appendFile(target, data);
       return { created: !existed };
     }
-    await fs.writeFile(target, data);
-    return { created: true };
+    // Atomic replace via the shared helper (resolves symlinks with
+    // a sandbox check, preserves permissions, refuses read-only
+    // targets, fsyncs, retries Windows locks). Returns whether the
+    // file existed, so overwrite of an existing file reports
+    // created:false. ('new' uses 'wx' and 'append' is untouched.)
+    const { existed } = await atomicWrite(target, data, { rootRealDir });
+    return { created: !existed };
   }
 
   public async ensureDir(relDir: string): Promise<void> {
@@ -183,6 +205,20 @@ export class LocalStorageBackend implements StorageBackend {
   ): Promise<string[]> {
     const needle = keyword.toLowerCase();
     const hits: string[] = [];
+    // The search root was sandbox-checked by the caller, but the walk
+    // discovers entries the caller never validated. A symlink inside
+    // the root may point at a file outside it, and fs.stat follows
+    // symlinks, so without this check its content would be read and
+    // matched. Resolve the real root once and skip any entry whose
+    // real location escapes it. Within-root symlinks behave like the
+    // files they point at, matching read_file's sandbox rule.
+    let rootRealDir: string;
+    try {
+      rootRealDir = await fs.realpath(this.rootDir);
+    } catch {
+      rootRealDir = this.rootDir;
+    }
+    const visitedDirs = new Set<string>([rootRealDir]);
     const queue: string[] = [relDir];
     while (queue.length > 0 && hits.length < maxResults) {
       const current = queue.shift() as string;
@@ -196,8 +232,21 @@ export class LocalStorageBackend implements StorageBackend {
         if (hits.length >= maxResults) {
           break;
         }
+        let real: string;
+        try {
+          real = await fs.realpath(this.absolute(entry.relPath));
+          if (!isInside(rootRealDir, real)) {
+            continue;
+          }
+        } catch {
+          // Vanished or broken link: nothing readable here.
+          continue;
+        }
         if (entry.type === 'directory') {
-          queue.push(entry.relPath);
+          if (!visitedDirs.has(real)) {
+            visitedDirs.add(real);
+            queue.push(entry.relPath);
+          }
           continue;
         }
         if (entry.name.toLowerCase().includes(needle)) {

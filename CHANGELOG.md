@@ -8,6 +8,118 @@ earlier versions were delivered as zips and verified by the
 protocol suite (see TEST-REPORT.md). Each section below maps
 to a GitHub Release.
 
+## [0.7.0] - Unreleased
+
+Foundation release, no new features. Security fixes, a Node floor
+raise, CI, the permanent removal of WebDAV, image caps, and atomic
+writes — plus fixes from a second Claude Desktop review of the full
+source (2026-11-06). Not yet published.
+
+### Added
+
+- GitHub Actions CI (`.github/workflows/ci.yml`): 3 OS
+  (windows-latest, ubuntu-latest, macos-latest) × Node 24 and 26;
+  on push and pull_request runs `npm ci`, `npm run typecheck`,
+  `npm run build`, `npm test`.
+- `npm prepack` (`npm run build`), so published packages are always
+  built from current source.
+
+### Changed
+
+- Node floor raised to 24: `engines >=24` in `package.json`;
+  `setup.bat`, `setup.sh`, and `setup.command` all require Node 24
+  or newer. Node 22 support ends 2027-04-30.
+- The per-save image budget is now two counters
+  (`src/images.ts`, `src/tools.ts`): a download-traffic counter
+  (500 MB) and a stored-image budget (500 MB). A download stops at
+  the lowest of the per-download ceiling (500 MB, unchanged), the
+  remaining download traffic, and the remaining stored budget, so
+  an image too large to store is aborted immediately instead of
+  downloaded in full first; the stored budget is deducted only
+  after a download completes and is confirmed to be an image, so a
+  failed or non-image download no longer blocks later legitimate
+  images. Either counter exhausted refuses further fetches without
+  fetching; only the stored budget stops the image loop. Notes name
+  which cap was hit, and the doubled `skipped:` prefix is gone.
+- `save_file` image caps: at most 10 images per save; all images
+  acquired in one save together at most 500 MB stored. The
+  per-download ceiling (500 MB) is unchanged — no new per-image
+  cap.
+- Config and note writes share one atomic-write helper
+  (`src/atomic.ts`): resolves symlinks, preserves permissions,
+  refuses read-only targets, fsyncs, and retries Windows file
+  locks (EPERM/EBUSY/EACCES, 5 attempts, 50–200 ms backoff).
+  `writeFile` 'overwrite' now reports `created:false` for an
+  existing file (previously always `created:true`).
+
+### Fixed
+
+- `search_files` symlink hole: the walk used to follow a symlink
+  inside the root to a small outside text file and return its
+  matching line as an excerpt. It now skips any entry whose real
+  location escapes the root.
+- Image URL download: explicit redirect limit of 5 (manual
+  redirect handling); every fetch target must resolve to a public
+  address. Loopback, private (RFC 1918 / ULA), link-local
+  (including 169.254.169.254), and other non-routable ranges are
+  refused before fetching. IPv6 now also blocks NAT64
+  (64:ff9b::/96), 6to4 (2002::/16), site-local (fec0::/10), and
+  Teredo (2001::/32); a literal IPv6 address is checked directly
+  instead of going through DNS (Node's `URL.hostname` keeps the
+  brackets, which `dns.lookup` cannot resolve).
+- `save_file` no longer stores images through a symlinked
+  `assets/` folder pointing outside the library: the assets folder
+  is sandbox-checked first; on failure the images are refused with
+  a note and the text still saves.
+- Local image copy refuses non-regular files (`/dev/zero`, FIFOs,
+  device nodes) instead of reading them until the process dies;
+  a stat failure is reported directly instead of falling through
+  to a misleading read error.
+- Windows command injection in the viewer: `openInViewer` /
+  `openFolderInViewer` refuse paths containing `& | < > ^ %` on
+  win32 (cmd.exe re-parses the line), instead of launching.
+  The launch mechanism itself is unchanged.
+- Image refs with spaces or parentheses in the doc name:
+  the ref is percent-encoded on write (`(`, `)` → `%28`, `%29`)
+  and decoded on scan, so `read_file` finds the image again.
+  Pre-existing notes with unencoded refs are unchanged.
+- Overwrite no longer fails on long filenames: the shared
+  atomic-write helper uses a short fixed temp name instead of
+  appending ~30 characters to the target name.
+- Orphaned atomic-write temp files (`.mdtmp-<hex>`, random 12-char hex suffix) are
+  skipped by `listDirectory`, so they never appear as notes in
+  listings or search.
+- The setup wizard now prints the manual config snippet (plus a
+  plain error) when updating a host config throws, instead of
+  only `Setup stopped: ...`.
+- DNS rebinding protection (`src/net-guard.ts`): image URL downloads
+  now use `node:http`/`node:https` with `agent: false` and a custom
+  `lookup` callback that resolves the hostname once, validates every
+  resolved IP against the public-address policy, and connects only to
+  that validated batch (supporting both `all: true` and single-address
+  callback forms). Literal IPv4 and bracketed IPv6 hosts are validated
+  before connecting.
+- Magic-byte fallback in `read_file`, bundled Markdown reads,
+  `open_image`, and `copyLocalImage` is restricted to extensionless
+  files (`ext === ''`), and BMP/GIF magic-byte checks are tightened
+  so text notes starting with `"BM"` or `"GIF8"` are never
+  misidentified as images.
+- `encodeImageSrc` preserves non-whitespace CJK characters for readable
+  Markdown links while percent-encoding ASCII and non-ASCII whitespace
+  (such as `\u3000`), BOM, control characters, and `#`, `?`, `%`,
+  parentheses, `<`, `>`, `[`, `]`, quotes, backtick, and backslash.
+- `save_file` in `new` mode checks whether the destination file already
+  exists before acquiring or writing images, and URL download streaming
+  caps `ceiling` at `min(URL_DOWNLOAD_MAX_BYTES, downloadRemainingBytes,
+  storedRemainingBytes)`.
+
+### Removed
+
+- WebDAV, permanently, local-only: mentions deleted from
+  `README.md`, `package.json` (description and keywords), and the
+  header comments of `src/storage.ts` and `src/index.ts`.
+  `CHANGELOG.md` and TEST-REPORT.md keep their historical mentions.
+
 ## [0.6.0] - 2026-10-31
 
 ### Added — UNVERIFIED on a real machine

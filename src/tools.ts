@@ -23,9 +23,11 @@ import type {
 import { z } from 'zod';
 
 import {
-  IMAGE_EXTENSIONS,
   IMAGE_PREVIEW_MAX_BYTES,
   READ_MAX_IMAGES,
+  SAVE_IMAGES_MAX_DOWNLOAD_BYTES,
+  SAVE_IMAGES_MAX_TOTAL_BYTES,
+  SAVE_MAX_IMAGES,
   SEARCH_MAX_RESULTS,
   SVG_EXTENSION,
   TEXT_MAX_BYTES,
@@ -36,7 +38,9 @@ import {
   acquireImage,
   base64Length,
   detectImageMime,
+  encodeImageSrc,
   extensionForMime,
+  type ImageSaveBudget,
   makePreview,
   maxBinaryForBase64Budget,
   mimeFromExtension,
@@ -132,13 +136,24 @@ function assembleText(
     return truncateUtf8(body, allowedTextBytes);
   }
   const notesSection = `\n\n[MemDrive notes]\n${notes.map((n) => `- ${n}`).join('\n')}`;
-  if (utf8Bytes(notesSection) >= allowedTextBytes) {
-    return truncateUtf8(notesSection, allowedTextBytes);
+  const notesBytes = utf8Bytes(notesSection);
+  const bodyBytes = utf8Bytes(body);
+  if (bodyBytes + notesBytes <= allowedTextBytes) {
+    return body + notesSection;
   }
-  return (
-    truncateUtf8(body, allowedTextBytes - utf8Bytes(notesSection)) +
-    notesSection
-  );
+  if (imageBase64Total === 0) {
+    if (notesBytes >= allowedTextBytes) {
+      return truncateUtf8(notesSection, allowedTextBytes);
+    }
+    return truncateUtf8(body, allowedTextBytes - notesBytes) + notesSection;
+  }
+  // When images are included, text body is guaranteed first; notes use remaining text allowance.
+  const fittedBody = truncateUtf8(body, allowedTextBytes);
+  const remainingForNotes = allowedTextBytes - utf8Bytes(fittedBody);
+  if (remainingForNotes <= 0) {
+    return fittedBody;
+  }
+  return fittedBody + truncateUtf8(notesSection, remainingForNotes);
 }
 
 function timestampStem(date: Date): string {
@@ -271,20 +286,50 @@ async function handleSaveFile(
   if (rel === '.') {
     throw new MemDriveError('INVALID_PATH', 'save_file needs a file path, not the library root.');
   }
+  if (mode === 'new' && (await ctx.backend.exists(rel))) {
+    throw new MemDriveError(
+      'ALREADY_EXISTS',
+      `File already exists: ${rel}. Use mode "overwrite" to replace it or "append" to add to it.`,
+    );
+  }
   const docExt = path.extname(absolute).toLowerCase();
   const docStem = path.basename(absolute, path.extname(absolute));
   const docDirRel = path.dirname(rel) === '.' ? '' : path.dirname(rel).split(path.sep).join('/');
 
   // 1. Acquire images first (bytes in memory). Failures become notes;
-  //    they never block the text save.
+  //    they never block the text save. At most SAVE_MAX_IMAGES specs
+  //    are attempted, and everything kept together must fit the
+  //    per-save stored-image budget while downloads together must
+  //    fit the download-traffic budget. Hitting the count cap or
+  //    exhausting the stored budget stops the loop with a note
+  //    naming the cap; an exhausted download budget only refuses
+  //    further URL fetches, local and clipboard images can still
+  //    be acquired.
   const notes: string[] = [];
   const acquired: Array<{ data: Buffer; mimeType: string; baseName: string }> = [];
-  for (const spec of imageSpecs ?? []) {
-    const result = await acquireImage(spec);
+  const budget: ImageSaveBudget = {
+    storedRemainingBytes: SAVE_IMAGES_MAX_TOTAL_BYTES,
+    downloadRemainingBytes: SAVE_IMAGES_MAX_DOWNLOAD_BYTES,
+  };
+  const specs = imageSpecs ?? [];
+  for (let i = 0; i < specs.length; i++) {
+    const spec = specs[i] as string;
+    if (i >= SAVE_MAX_IMAGES) {
+      notes.push(
+        `Image limit reached: only the first ${SAVE_MAX_IMAGES} images were processed; ${specs.length - SAVE_MAX_IMAGES} more image(s) were skipped.`,
+      );
+      break;
+    }
+    const result = await acquireImage(spec, budget);
     if (result.ok) {
       acquired.push(result.image);
     } else {
       notes.push(`Image ${JSON.stringify(spec)} skipped: ${result.note}`);
+    }
+    // The stored budget is exhausted: stop the loop instead of
+    // producing one refusal note per remaining spec.
+    if (budget.storedRemainingBytes <= 0) {
+      break;
     }
   }
 
@@ -294,26 +339,42 @@ async function handleSaveFile(
   const savedImages: SavedImageInfo[] = [];
   if (acquired.length > 0) {
     const assetsRel = docDirRel === '' ? 'assets' : `${docDirRel}/assets`;
-    await ctx.backend.ensureDir(assetsRel);
-    const stamp = timestampStem(new Date());
-    for (const image of acquired) {
-      const ext = extensionForMime(image.mimeType);
-      let candidate = `${docStem}-${stamp}.${ext}`;
-      let attempt = 1;
-      while (await ctx.backend.exists(`${assetsRel}/${candidate}`)) {
-        attempt += 1;
-        candidate = `${docStem}-${stamp}-${attempt}.${ext}`;
-      }
-      try {
-        await ctx.backend.writeFile(`${assetsRel}/${candidate}`, image.data, 'new');
-        savedImages.push({
-          fileName: candidate,
-          relPath: `${assetsRel}/${candidate}`,
-          alt: image.baseName,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        notes.push(`Image ${image.baseName} could not be stored: ${message}`);
+    // The doc path was sandbox-checked, but the assets folder was
+    // not: a symlink inside the library could point it outside, and
+    // the images would be written outside the root. Refuse the
+    // images with a note; the text still saves.
+    let assetsOk = true;
+    try {
+      await sandboxPath(ctx.rootDir, ctx.rootRealDir, assetsRel);
+    } catch {
+      assetsOk = false;
+      notes.push(
+        'Images were not stored: the assets folder links outside the library.',
+      );
+    }
+    if (assetsOk) {
+      await ctx.backend.ensureDir(assetsRel);
+      const stamp = timestampStem(new Date());
+      const safeStem = truncateUtf8(docStem, 200);
+      for (const image of acquired) {
+        const ext = extensionForMime(image.mimeType);
+        let candidate = `${safeStem}-${stamp}.${ext}`;
+        let attempt = 1;
+        while (await ctx.backend.exists(`${assetsRel}/${candidate}`)) {
+          attempt += 1;
+          candidate = `${safeStem}-${stamp}-${attempt}.${ext}`;
+        }
+        try {
+          await ctx.backend.writeFile(`${assetsRel}/${candidate}`, image.data, 'new');
+          savedImages.push({
+            fileName: candidate,
+            relPath: `${assetsRel}/${candidate}`,
+            alt: image.baseName,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          notes.push(`Image ${image.baseName} could not be stored: ${message}`);
+        }
       }
     }
   }
@@ -324,7 +385,7 @@ async function handleSaveFile(
   let body = content;
   if (savedImages.length > 0 && docExt === '.md') {
     const refs = savedImages
-      .map((img) => `\n![${img.alt}](assets/${img.fileName})`)
+      .map((img) => `\n![${img.alt}](assets/${encodeImageSrc(img.fileName)})`)
       .join('');
     body += `${body.length > 0 && !body.endsWith('\n') ? '\n' : ''}${refs}\n`;
   }
@@ -398,8 +459,12 @@ async function handleReadFile(
   // Direct image read: this one image gets the whole budget. It is
   // returned untouched when it fits, and downscaled in memory only
   // when the image itself exceeds the budget (or the per-image cap).
-  if (IMAGE_EXTENSIONS.has(ext)) {
-    const mimeType = ext === '.jpg' ? 'image/jpeg' : `image/${ext.slice(1)}`;
+  const directImageMime =
+    ext === SVG_EXTENSION
+      ? null
+      : (mimeFromExtension(absolute) ?? (ext === '' ? detectImageMime(data) : null));
+  if (directImageMime !== null) {
+    const mimeType = directImageMime;
     const effectiveCap = Math.min(
       IMAGE_PREVIEW_MAX_BYTES,
       maxBinaryForBase64Budget(
@@ -562,16 +627,18 @@ async function handleReadFile(
         const imageData = await ctx.backend.readFile(imageRel === '.' ? '' : imageRel);
         const imageExt = path.extname(imageAbs).toLowerCase();
         const mimeType =
-          imageExt === '.jpg'
-            ? 'image/jpeg'
-            : IMAGE_EXTENSIONS.has(imageExt)
-              ? `image/${imageExt.slice(1)}`
-              : null;
+          imageExt === SVG_EXTENSION
+            ? null
+            : (mimeFromExtension(imageAbs) ?? (imageExt === '' ? detectImageMime(imageData) : null));
         if (mimeType === null) {
           notes.push(`Skipped referenced file with unsupported image type: ${ref.src}.`);
           continue;
         }
-        const remaining = budget - runningTextBytes - imageBase64Total;
+        const currentNotesBytes =
+          notes.length > 0
+            ? utf8Bytes(`\n\n[MemDrive notes]\n${notes.map((n) => `- ${n}`).join('\n')}`)
+            : 0;
+        const remaining = budget - runningTextBytes - currentNotesBytes - 256 - imageBase64Total;
         if (remaining <= 0) {
           notes.push(
             `Skipped image ${ref.src}: the ${formatBytes(budget)} total response budget is already used by the text. Read it directly with read_file on "${imageRel}" for full quality.`,
@@ -661,14 +728,14 @@ function truncateUtf8(text: string, maxBytes: number): string {
 /**
  * Sniff the first bytes of a file for an image signature. Used only
  * when the file extension does not identify an image, so an
- * extensionless image file can still be opened; reading 16 bytes is
+ * extensionless image file can still be opened; reading 32 bytes is
  * enough for every signature `detectImageMime` checks.
  */
 async function sniffImageMime(absolutePath: string): Promise<string | null> {
   let handle: fs.FileHandle | null = null;
   try {
     handle = await fs.open(absolutePath, 'r');
-    const buffer = Buffer.alloc(16);
+    const buffer = Buffer.alloc(32);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (bytesRead === 0) {
       return null;
@@ -703,7 +770,7 @@ async function handleOpenImage(
   // ever receive a file that is actually an image.
   const isImage =
     mimeFromExtension(absolute) !== null ||
-    (await sniffImageMime(absolute)) !== null;
+    (path.extname(absolute) === '' && (await sniffImageMime(absolute)) !== null);
   if (!isImage) {
     throw new MemDriveError(
       'NOT_AN_IMAGE',
