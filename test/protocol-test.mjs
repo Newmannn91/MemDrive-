@@ -2633,7 +2633,13 @@ async function main() {
       const idx = new LocalSearchIndex(libDir, libDir, backend);
       await fs.writeFile(path.join(libDir, 'a.md'), '全文检索 in markdown.\n');
       await fs.writeFile(path.join(libDir, 'b.txt'), '全文检索 in text.\n');
-      const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+      // The real server resolves the root with fs.realpath at startup
+      // (src/index.ts); the test must do the same. On macOS os.tmpdir()
+      // is /var/folders/... while /var is a symlink to /private/var, so
+      // the unresolved libDir fails the sandbox's realpath check with
+      // "Path escapes the MemDrive root through a symlink" (CI: macOS
+      // only, 124/125). This mirrors the server, it does not weaken it.
+      const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
       // Index never built: every search falls back to a direct scan.
       const res = await handleSearchFiles(ctx, '全文检索', '', {
         fileTypes: ['.md'],
