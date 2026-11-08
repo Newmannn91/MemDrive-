@@ -57,6 +57,7 @@ export class LocalStorageBackend {
                 type: isDir ? 'directory' : 'file',
                 size: isDir ? 0 : st.size,
                 modifiedAt: st.mtime.toISOString(),
+                isSymlink: dirent.isSymbolicLink(),
             });
         }
         entries.sort((a, b) => {
@@ -77,6 +78,7 @@ export class LocalStorageBackend {
                 size: st.size,
                 isDirectory: st.isDirectory(),
                 modifiedAt: st.mtime.toISOString(),
+                blocks: st.blocks,
             };
         }
         catch (error) {

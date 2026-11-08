@@ -52,10 +52,87 @@ export function cleanPath(input: string): string {
 
 /** True when `target` is `dir` itself or lives underneath it. */
 export function isInside(dir: string, target: string): boolean {
-  const rel = path.relative(dir, target);
+  let d = dir;
+  let t = target;
+  // On case-insensitive filesystems (macOS/Windows) the configured
+  // root's case may differ from the on-disk case, and macOS stores
+  // filenames NFD while input is usually NFC. Compare NFKC-normalized,
+  // lowercased paths there so a case/normalization mismatch does not
+  // falsely report an escape. Linux stays exact (case-sensitive FS).
+  if (process.platform === 'darwin' || process.platform === 'win32') {
+    d = dir.normalize('NFKC').toLowerCase();
+    t = target.normalize('NFKC').toLowerCase();
+  }
+  const rel = path.relative(d, t);
   return (
     rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))
   );
+}
+
+/** Windows reserved device names (checked against the segment stem, ignoring extension). */
+const WINDOWS_RESERVED_NAMES = new Set([
+  'CON',
+  'PRN',
+  'AUX',
+  'NUL',
+  'COM1',
+  'COM2',
+  'COM3',
+  'COM4',
+  'COM5',
+  'COM6',
+  'COM7',
+  'COM8',
+  'COM9',
+  'LPT1',
+  'LPT2',
+  'LPT3',
+  'LPT4',
+  'LPT5',
+  'LPT6',
+  'LPT7',
+  'LPT8',
+  'LPT9',
+]);
+
+/**
+ * Validate path segments for cross-platform safety. Rejects Windows
+ * reserved device names (CON, NUL, COM1–COM9, LPT1–LPT9, ignoring the
+ * extension), NTFS alternate-data-stream segments (`a.md:$DATA`),
+ * segments ending in a dot or space (Windows strips them, so the
+ * on-disk name would differ from the requested one), and UNC paths.
+ * A leading Windows drive letter (`C:`) is allowed and skipped. A
+ * file that is safe on macOS/Linux but unreadable on Windows is a
+ * sync-time trap, so the check runs on every platform.
+ */
+export function validateCrossPlatformSegments(input: string): void {
+  const unified = input.replace(/\\/g, '/');
+  if (unified.startsWith('//')) {
+    throw new SandboxError(`UNC paths are not allowed: ${JSON.stringify(input)}`);
+  }
+  const segments = unified.split('/').filter((s) => s.length > 0 && s !== '.' && s !== '..');
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i] as string;
+    if (i === 0 && /^[A-Za-z]:$/.test(seg)) {
+      continue; // Windows drive letter.
+    }
+    if (seg.includes(':')) {
+      throw new SandboxError(
+        `Path segment contains ':' (NTFS alternate data stream): ${JSON.stringify(seg)}`,
+      );
+    }
+    if (seg.endsWith('.') || seg.endsWith(' ')) {
+      throw new SandboxError(
+        `Path segment ends with a dot or space (not portable to Windows): ${JSON.stringify(seg)}`,
+      );
+    }
+    const stem = (seg.split('.')[0] as string).toUpperCase();
+    if (WINDOWS_RESERVED_NAMES.has(stem)) {
+      throw new SandboxError(
+        `Path segment is a Windows reserved device name: ${JSON.stringify(seg)}`,
+      );
+    }
+  }
 }
 
 /**
@@ -149,8 +226,8 @@ export async function assertInsideRealRoot(
 }
 
 /**
- * Full sandbox gate for one user-supplied path: lexical check + realpath
- * check. Returns the absolute path to use.
+ * Full sandbox gate for one user-supplied path: lexical check +
+ * realpath check. Returns the absolute path to use.
  */
 export async function sandboxPath(
   rootDir: string,
@@ -158,6 +235,26 @@ export async function sandboxPath(
   input: string,
 ): Promise<string> {
   const absolute = resolveInRoot(rootDir, input);
+  return assertInsideRealRoot(rootRealDir, absolute);
+}
+
+/**
+ * Same as sandboxPath, plus the cross-platform segment check — for
+ * WRITES only (save_file). Reads keep 0.7.0 behavior: a file saved
+ * elsewhere (or synced in) as `meeting 10:30.md` or `aux.notes.md`
+ * is a legal name on Linux/macOS and must still open; rejecting it
+ * on read broke existing libraries.
+ */
+export async function sandboxPathForWrite(
+  rootDir: string,
+  rootRealDir: string,
+  input: string,
+): Promise<string> {
+  const absolute = resolveInRoot(rootDir, input);
+  // Cross-platform check on the root-relative part only (the root
+  // itself is the user's own directory and may legitimately contain
+  // any name).
+  validateCrossPlatformSegments(path.relative(rootDir, absolute));
   return assertInsideRealRoot(rootRealDir, absolute);
 }
 

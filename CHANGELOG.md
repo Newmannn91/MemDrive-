@@ -8,6 +8,215 @@ earlier versions were delivered as zips and verified by the
 protocol suite (see TEST-REPORT.md). Each section below maps
 to a GitHub Release.
 
+## [0.8.0] - 2026-11-08
+
+Search engine: a full-text index with BM25 ranking replaces the
+single-keyword substring scan. Chinese queries are segmented, results
+are ranked chunks with snippets, and the library gains filters,
+pagination, and a read-only diagnostics report.
+
+### Added
+
+- Full-text search index (`src/search-index.ts`, `SearchIndex`
+  interface + `LocalSearchIndex`): pure-JS inverted index, zero
+  native deps; persisted as one JSON file OUTSIDE the library
+  (system cache dir, subdir named by the first 16 hex chars of the
+  SHA-256 of the library's real path — `MEMDRIVE_CACHE_DIR`
+  overrides the base), so sync drives never corrupt it and
+  list/search never see it as a note. Format version 2; a mismatch
+  or a damaged structure triggers a rebuild.
+- Chinese tokenization: Node `Intl.Segmenter('zh')` (word
+  granularity) + character bigram + single-char fallback, so 1–2
+  character queries hit; NFKC normalization of queries and
+  filenames (macOS filenames are NFD). A regex fallback covers
+  runtimes without `Intl.Segmenter`.
+- Chunk-based index: heading/paragraph chunks, 600-char cap,
+  100-char overlap, exact `[startOffset, endOffset]` per chunk and
+  a section heading, so a future vector search needs no rework.
+- Ranking: Okapi BM25 (k1 = 1.2, b = 0.75) fused with a
+  filename-match ranking via reciprocal rank fusion (RRF, k = 60).
+  The filename's tokens are indexed on the file's first chunk, so a
+  file is findable by name even when its content never mentions the
+  keyword (the 0.7.0 search matched by name OR content; the index
+  keeps both). Empty files get one synthetic chunk carrying only
+  their filename tokens.
+- `search_files` gains `file_types`, `tags` (YAML front matter
+  `tags:` or body `#tag`, case-insensitive, `#a/b` kept whole),
+  `date_from`/`date_to` (file date: front matter > filename >
+  modification time; a date-only upper bound covers the whole day),
+  `modified_after`/`modified_before`, `exact_phrase`, `limit`/
+  `offset` pagination, `rebuild_index`, and `diagnostics_only`.
+  Results are one hit per matching file (its best chunk) with the
+  file path, section, relevance score, and a snippet with the
+  matched term highlighted as `**term**`; a substring of a filename
+  still finds the file, including non-text files such as images
+  (the 0.7.0 name search). `keyword` is now optional when
+  `diagnostics_only` is set. Output is capped by
+  `MEMDRIVE_SEARCH_MAX_BYTES` (default 80,000 bytes, clamped to
+  1,000–50,000,000); the output is fitted to the cap hit by hit, so
+  the "More results" line and the next page's offset are never cut
+  off or skipped by truncation. `keyword` + `path` keep the 0.7.0
+  calling format, but results are ranked files, not the 0.7.0
+  name/content list — see Changed below.
+- Background incremental indexing: the index builds in the
+  background on first use (yielding the event loop); searches fall
+  back to a direct scan (0.7.0 behavior) until it is ready. A light
+  stat scan refreshes the index incrementally — mtime+size first,
+  SHA-256 hash only on mismatch — throttled to at most once per
+  5 seconds, and it runs in the background so a query does not wait
+  for it; a save (`save_file`) marks its file dirty, so the next
+  search refreshes before answering and the new note is searchable
+  at once. When more than 5% of files (or 200) changed, a full
+  rebuild replaces the incremental update — it is faster. Files
+  over the content cap (`MEMDRIVE_INDEX_MAX_BYTES`, default 1 MB,
+  clamped to 1 KB–50 MB) and `.log`/`.csv`/`.json` files are indexed
+  by filename only and never read in full. iCloud placeholder files
+  (`.icloud`) are skipped, never read; on macOS a dataless file
+  (`stat.blocks === 0 && size > 0`) is skipped the same way.
+  OneDrive placeholders on Windows carry no detectable marker, so
+  indexing there can still trigger a download — documented, not
+  claimed otherwise.
+- Single-writer lock: the index file is written under a lock file
+  (`index.lock`, 30 s staleness timeout, stale locks are stolen);
+  a full rebuild holds the lock for the whole build, and when
+  another process holds the lock the write is skipped and the
+  in-memory index keeps serving, so several MCP clients sharing one
+  library never corrupt the index.
+- Read-only diagnostics (`diagnostics_only`, also the
+  `scanDiagnostics` core): empty files, duplicate groups (SHA-256),
+  broken Markdown image references, and unreferenced attachment
+  candidates older than 24 h. Candidates only; nothing is modified.
+  Hashes come from the index when the recorded mtime/size still
+  match, so a scan does not re-read (and re-hash) the whole
+  library. Obsidian embeds resolve by filename across the whole
+  library, as Obsidian does; the orphan walk cannot escape the
+  library through a symlink.
+- Markdown image references (`src/images.ts`): Obsidian embeds
+  (`![[img.png]]`, `![[folder/img.png|alt]]`) and reference-style
+  (`![alt][id]` + `[id]: src`, including collapsed `![id][]` and
+  definitions with a title) are now found, alongside the 0.7.0
+  inline and `<img>` forms. Obsidian embeds of notes and PDFs
+  (`![[Meeting Notes]]`, `![[spec.pdf]]`) are not image references,
+  and a `#fragment` in an embed is not part of the on-disk path.
+- Cross-platform path validation (`src/sandbox.ts`):
+  `validateCrossPlatformSegments` rejects Windows reserved device
+  names (`CON`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, ignoring the
+  extension), NTFS alternate-data-stream segments (`a.md:$DATA`),
+  segments ending in a dot or space, and UNC paths; a leading
+  Windows drive letter is allowed. The check runs on WRITES only
+  (`save_file`): reads keep 0.7.0 behavior, so a file synced in as
+  `meeting 10:30.md` or `aux.notes.md` still opens. `isInside` now
+  compares NFKC-normalized, lowercased paths on macOS/Windows
+  (case-insensitive filesystems), exact on Linux.
+
+### Fixed
+
+Review round on the 0.8.0 package (2026-11-08, Sonnet; every
+finding verified against the code and by live reproduction before
+fixing):
+
+- `__proto__` as an indexed term polluted `Object.prototype`
+  (postings/files maps are now null-prototype objects; a damaged
+  index file no longer loads as `ready` and then fails every
+  search — it rebuilds, and a failed search falls back to a direct
+  scan and triggers a rebuild).
+- Bulk updates were slower than a full rebuild (removal scanned the
+  whole postings map and chunk ids were found by a full scan each
+  time): each file now records its own terms, chunk ids come from a
+  counter, and the refresh yields between files; a 500-file change
+  in 5,000 notes now rebuilds in ~4 s instead of stalling for
+  ~15 s, and a 100-file change refreshes incrementally in ~1 s.
+- A 60 MB `.log` blocked the server for ~12 s and wrote a 31 MB
+  index (now 31 ms, 714 bytes: filename only).
+- `save_file` did not tell the index (a new note was unsearchable
+  for up to 5 s); query-time refresh no longer blocks on the stat
+  scan, and the direct-scan fallback now applies the file-type
+  filter and pagination and says which filters it did not apply.
+- Long-note results flooded the page and `total` counted chunks;
+  search results are now one hit per file and `total` counts files.
+- Snippet highlighting measured offsets on the NFKC-normalized
+  string and sliced the original with them, sometimes leaving only
+  `…` as the snippet; offsets are now measured on the original.
+- Date filters: a date-only upper bound now covers the whole day,
+  and an unparseable date is an error instead of a silently ignored
+  filter. Tags: block lists no longer yield a bogus `- alpha` tag,
+  matching is case-insensitive, `#a/b` stays whole.
+- Search no longer loses the 0.7.0 filename-substring behavior
+  (`memdr` finds `memdrive-notes.md`, `shot` finds `shot.png`), and
+  single-character terms only count when the query itself is one
+  character.
+- The chunk cap is now enforced for the common cases (blank lines
+  between short paragraphs no longer push slices over 600 chars);
+  one narrow case remains — a near-cap paragraph after a wide gap
+  can exceed the cap by the length of the whitespace between the
+  two paragraphs (usually a few chars; a 50-line gap produced a
+  639-char slice, a 1,000-line gap a 1,589-char slice — see Notes).
+- `diagnostics_only` no longer requires a `keyword` and now honors
+  `path` as its scope.
+
+Second review round on the fixed package (2026-11-08, Sonnet;
+every finding verified against the code and by live reproduction
+before fixing):
+
+- Chinese queries the segmenter splits into single characters only
+  (说了 -> 说 / 了) no longer match every note containing the
+  particles: the query's CJK run must now appear verbatim in the
+  chunk (an implicit exact phrase); queries that segment into a
+  multi-character term are unchanged.
+- Obsidian embeds with a path (`![[attachments/pic.png]]`) now
+  resolve vault-root first, then note-relative, then by path
+  suffix — a nested note no longer reports a vault-root file as
+  a broken reference or an orphan.
+- `#` / `?` are stripped only for Obsidian embeds (where `#` is an
+  anchor); inline, `<img>`, and reference-style refs keep the
+  literal path, as in 0.7.0 (`notes/C#/pic.png` no longer parses
+  as `notes/C`).
+- Diagnostics never reads a dataless cloud file (macOS): the walk
+  marks such files and the scan skips them, so no iCloud/OneDrive
+  download is triggered.
+
+### Changed
+
+- `search_files` results are ranked chunks, not the 0.7.0
+  name/content file list. The direct-scan fallback (used while the
+  index builds) still returns the 0.7.0 format.
+- `User-Agent` for image downloads is now `memdrive-mcp/0.8.0`.
+
+### Notes
+
+- DNS rebinding guard (from 0.7.0, `src/net-guard.ts`):
+  unchanged in 0.8.0. The download path already uses
+  `node:http`/`node:https` with `agent: false` and a custom
+  `lookup` (single resolution, every address validated, checked
+  address = connected address); the 0.7.0 local-server test for it
+  still passes. No `fetch` remains in `src/`.
+- Performance (10,000 synthetic notes, this VM, three runs;
+  benchmark vocabulary widened from 36 to ~300 words for the
+  review round, so these numbers are not comparable with the
+  pre-review ones): cold index ~13.2–14.6 s; hot query p50
+  23–24 ms, p95 56–77 ms, p99 67–679 ms, max 70–874 ms (the tail
+  varies run to run; a query landing while a background refresh
+  walks the library can spike); incremental update of 10 changed
+  files ~0.67–0.75 s (a 10-file refresh took ~5 s before the
+  walk/remove/persist optimizations in the review round); heap
+  ~295–450 MB, RSS ~750–800 MB after build. A fresh load() of the
+  persisted index takes ~3.3 s at 10,000 notes (the review round
+  added a full structural validation on load); the index file is
+  ~46 MB (was ~29 MB before the review round, mostly the
+  per-file term lists). Both grow with library size. See
+  TEST-REPORT.md and `test/bench-search.mjs` (deterministic,
+  seeded).
+- Known limitations (deferred to 0.8.1): chunk slices can exceed
+  the 600-char cap by the length of the whitespace between the
+  two paragraphs when a near-cap paragraph follows a wide gap
+  (overlap shrinks to 0 and the gap counts toward the slice;
+  usually a few chars, but a 50-line gap produced a 639-char
+  slice and a 1,000-line gap a 1,589-char slice); `rebuild_index`
+  while another process holds
+  the index lock silently does nothing; a second process that
+  starts while the first is building keeps using the direct-scan
+  fallback instead of loading the finished index.
+
 ## [0.7.0] - Unreleased
 
 Foundation release, no new features. Security fixes, a Node floor

@@ -9,7 +9,7 @@ through six small tools. No cloud service, no account, no server to run —
 the MCP server runs on your own machine and touches only the folder you
 point it at.
 
-> **Status: 0.7.0.** Local filesystem backend only.
+> **Status: 0.8.0.** Local filesystem backend only. Full-text search index with BM25 ranking (Chinese segmentation, filters, pagination, read-only diagnostics).
 > 0.1.1 added one total response budget to `read_file` (see
 > [Reading back](#reading-back-packed-two-step-and-single-image) and
 > [Limits](#limits-all-in-srcconfigts-nowhere-else)) and put the
@@ -359,7 +359,7 @@ hosts are added only on user feedback after these four.
 | Tool | What it does |
 | --- | --- |
 | `list_directory(path?)` | Lists the immediate children of a directory in the library (root by default). |
-| `search_files(keyword, path?)` | Recursive keyword search: file names and, for small text files, contents. |
+| `search_files(keyword, path?, file_types?, tags?, date_from?, date_to?, modified_after?, modified_before?, exact_phrase?, limit?, offset?, rebuild_index?, diagnostics_only?)` | Full-text search (BM25-ranked chunks with snippets; Chinese queries are segmented). Filters by file type, tag, file date, and modification time; exact-phrase match; pagination (limit default 20, max 200); `diagnostics_only` returns a read-only library report. |
 | `save_file(path, content, mode?, images?)` | Writes text (usually Markdown). Modes: `new` (default, refuses to overwrite), `overwrite`, `append`. Parent folders are created automatically. Say "把截图存下来" and the model passes `images: ["clipboard"]` — the server reads the clipboard on your machine; never paste the image into the chat. |
 | `read_file(path, include_images?)` | Reads text, or a Markdown file **together with its referenced images** in one response, within one total response budget. Pass `include_images: false` for text only plus the image-path list (step 1 of two-step reading). |
 | `open_image(path)` | Opens an image file in the OS default image viewer, at full original quality. Only when the user explicitly asks to view the original — never automatically, and never returns image bytes to the model. |
@@ -524,9 +524,14 @@ single preview even when the total budget is raised above it.
 
 Other caps: at most 20 referenced images per `read_file` response (the
 total budget usually binds first);
-`search_files` returns at most 200 hits and only content-searches files
-under 256 KB; URL downloads have a 30 s timeout and a 500 MB safety
-ceiling (a disk-exhaustion guard, not a product limit).
+`search_files` returns ranked chunks (at most 200, paginated) and
+caps its result text at `MEMDRIVE_SEARCH_MAX_BYTES` (default 80 KB);
+URL downloads have a 30 s timeout and a 500 MB safety
+ceiling (a disk-exhaustion guard, not a product limit). The search
+index is a cache stored outside the library (system cache dir) and
+rebuilds automatically; on the first search after startup it may
+still be building, in which case the result falls back to a direct
+scan (keyword substring, files under 256 KB only) and says so.
 
 ## Security
 

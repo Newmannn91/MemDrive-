@@ -20,7 +20,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Jimp } from 'jimp';
 
-import { resolveResponseBudgetBytes } from '../dist/config.js';
+import { resolveResponseBudgetBytes, resolveSearchMaxBytes, resolveIndexCacheDir, resolveIndexMaxFileBytes } from '../dist/config.js';
 import {
   backupPathFor,
   claudeCodeAdapter,
@@ -34,10 +34,25 @@ import {
   writeHostConfig,
 } from '../dist/host-config.js';
 import { atomicWrite } from '../dist/atomic.js';
-import { acquireImage, detectImageMime, encodeImageSrc, extensionForMime, mimeFromExtension } from '../dist/images.js';
+import { acquireImage, detectImageMime, encodeImageSrc, extensionForMime, mimeFromExtension, scanMarkdownImages } from '../dist/images.js';
 import { BlockedUrlError, safeRequest } from '../dist/net-guard.js';
+import { LocalStorageBackend } from '../dist/storage.js';
+import { validateCrossPlatformSegments } from '../dist/sandbox.js';
+import {
+  LocalSearchIndex,
+  bm25,
+  chunkText,
+  extractDate,
+  extractTags,
+  highlightSnippet,
+  isPlaceholderFile,
+  normalizeText,
+  reciprocalRankFusion,
+  tokenize,
+  tokenizeQuery,
+} from '../dist/search-index.js';
 import { folderCommandFor, openFolderInViewer, openInViewer, viewerCommandFor } from '../dist/viewer.js';
-import { resolveContainingFolder } from '../dist/tools.js';
+import { handleSearchFiles, resolveContainingFolder } from '../dist/tools.js';
 import {
   buildServerEntry,
   configSnippet,
@@ -193,13 +208,19 @@ async function main() {
   await fs.mkdir(root, { recursive: true });
   const outside = path.join(scratch, 'outside');
   await fs.mkdir(outside, { recursive: true });
-  await fs.writeFile(path.join(outside, 'secret.txt'), 'TOP-SECRET-OUTSIDE-ROOT\n');
+  await fs.writeFile(path.join(outside, 'secret.txt'), 'ZQXJ TOP-SECRET-OUTSIDE-ROOT\n');
 
   let serverStderr = '';
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [SERVER],
-    env: { ...process.env, MEMDRIVE_ROOT: root },
+    env: {
+      ...process.env,
+      MEMDRIVE_ROOT: root,
+      // Keep the test server's search index in the scratch dir, never
+      // in the real user cache.
+      MEMDRIVE_CACHE_DIR: path.join(scratch, 'index-cache'),
+    },
     stderr: 'pipe',
   });
   transport.stderr?.on('data', (chunk) => {
@@ -897,10 +918,13 @@ async function main() {
     });
 
     await check('search_files matches by name and by content', async () => {
+      // 0.8.0 returns ranked chunks (path + score + snippet); the 0.7.0
+      // "(name)"/"(content)" kind labels are gone. Both paths (index
+      // and direct-scan fallback) list the file, so assert on the path.
       const byName = await call('search_files', { keyword: 'with-photo' });
-      assert.match(textOf(byName), /with-photo\.md \(name\)/);
+      assert.match(textOf(byName), /with-photo\.md/);
       const byContent = await call('search_files', { keyword: 'replaced+more' });
-      assert.match(textOf(byContent), /note\.md \(content\)/);
+      assert.match(textOf(byContent), /note\.md/);
     });
 
     await check('sandbox rejects ../ escape', async () => {
@@ -950,8 +974,11 @@ async function main() {
       // Regression test for the 0.7.0 search_files symlink hole: the
       // search walk used to follow a symlink to a small outside text
       // file, read its content, and return its matching line as an
-      // excerpt. The outside file holds 'TOP-SECRET-OUTSIDE-ROOT',
-      // a string that occurs nowhere inside the root.
+      // excerpt. The outside file holds 'ZQXJ', a nonsense term that
+      // occurs nowhere inside the root. (0.8.0 tokenizes the keyword,
+      // so a hyphenated identifier like 'TOP-SECRET-OUTSIDE-ROOT'
+      // would also match inside files containing 'root' — the single
+      // unique term keeps this test about the symlink, not ranking.)
       try {
         await fs.symlink(path.join(outside, 'secret.txt'), path.join(root, 'search-link.txt'), 'file');
       } catch (error) {
@@ -964,7 +991,7 @@ async function main() {
         }
         throw error;
       }
-      const res = await call('search_files', { keyword: 'TOP-SECRET-OUTSIDE-ROOT' });
+      const res = await call('search_files', { keyword: 'ZQXJ' });
       assert.equal(res.isError, undefined, textOf(res));
       const text = textOf(res);
       assert.match(text, /No files matching/);
@@ -2001,6 +2028,694 @@ async function main() {
       });
       assert.deepEqual(none, []);
     });
+
+    /* ------------------------------------------------------------ */
+    /* 0.8.0 search engine                                           */
+    /* ------------------------------------------------------------ */
+
+    await check('0.8.0 tokenizer: Chinese segmentation + bigram + single char, mixed, NFKC', async () => {
+      const tokens = tokenize('我喜欢用MemDrive记笔记');
+      assert.ok(tokens.includes('喜欢'), 'bigram 喜欢');
+      assert.ok(tokens.includes('记'), 'single char 记');
+      assert.ok(tokens.includes('memdrive'), 'latin word lowercased');
+      assert.ok(tokens.includes('记笔记'), 'segmented word');
+      // No double-count: a 1-char word and a 2-char word's bigram
+      // equal the word itself, so they must appear exactly once.
+      assert.equal(tokens.filter((t) => t === '我').length, 1);
+      assert.equal(tokens.filter((t) => t === '喜欢').length, 1);
+      assert.deepEqual(tokenizeQuery('全文检索'), [...new Set(tokenize('全文检索'))]);
+      // NFKC: full-width chars and compatibility forms fold.
+      assert.ok(tokenize('Ｆｕｌｌ').includes('full'));
+      assert.equal(normalizeText('é'), 'é');
+    });
+
+    await check('0.8.0 chunker: exact offsets, 600 cap, 100 overlap, sections', async () => {
+      const text = '# 标题一\n\n第一段内容。\n\n## 小节\n\n' + '啊'.repeat(700) + '\n\n# 标题二\n\n尾段。';
+      const chunks = chunkText(text);
+      assert.ok(chunks.length >= 3);
+      for (const c of chunks) {
+        assert.equal(text.slice(c.startOffset, c.endOffset).length, c.endOffset - c.startOffset);
+        assert.ok(c.endOffset - c.startOffset <= 600, `chunk over cap: ${c.endOffset - c.startOffset}`);
+      }
+      assert.deepEqual(chunks.map((c) => c.section).slice(0, 2), ['标题一', '小节']);
+      // Hard-split pair overlaps by exactly 100.
+      const hard = chunks.filter((c) => c.section === '小节');
+      assert.ok(hard.length >= 2);
+      assert.equal(hard[0].endOffset - hard[1].startOffset, 100);
+      // Blank lines between units count toward the slice length:
+      // a note of short paragraphs separated by blank lines used
+      // to emit slices over the 600 cap.
+      let spaced = '';
+      for (let i = 0; i < 40; i++) {
+        spaced += `段落${i}内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容。\n\n`;
+      }
+      for (const c of chunkText(spaced)) {
+        assert.ok(c.endOffset - c.startOffset <= 600, `chunk over cap: ${c.endOffset - c.startOffset}`);
+      }
+    });
+
+    await check('0.8.0 tags/date extraction: front matter > filename > mtime', async () => {
+      assert.deepEqual(
+        extractTags('---\ntags: [工作, 读书]\n---\n正文 #生活 #工作\n').sort(),
+        ['工作', '读书', '生活'].sort(),
+      );
+      // Block-style list: no bogus `- alpha` item (the inline
+      // regex used to swallow the newline and eat the first item).
+      assert.deepEqual(
+        extractTags('---\ntags:\n  - alpha\n  - beta\n---\n正文 #project\n').sort(),
+        ['alpha', 'beta', 'project'].sort(),
+      );
+      // Tags are case-insensitive and keep no leading '#'; nested
+      // tags keep their `/`.
+      assert.deepEqual(
+        extractTags('正文 #Project #a/b #Work\n').sort(),
+        ['project', 'a/b', 'work'].sort(),
+      );
+      assert.equal(extractDate('x', '2026-11-08-note.md', 0), '2026-11-08T00:00:00.000Z');
+      assert.equal(extractDate('---\ndate: 2025-01-02\n---\n', 'note.md', 0), '2025-01-02T00:00:00.000Z');
+      assert.equal(extractDate('x', 'note.md', 0), new Date(0).toISOString());
+    });
+
+    await check('0.8.0 BM25 + RRF: scores sane, phrase-free ranking fuses', async () => {
+      assert.ok(bm25(2, 1, 100, 50, 50) > bm25(1, 1, 100, 50, 50));
+      assert.equal(bm25(0, 1, 100, 50, 50), 0);
+      assert.ok(bm25(1, 1, 100, 50, 50) > bm25(1, 50, 100, 50, 50), 'rare term scores higher');
+      const fused = reciprocalRankFusion([[1, 2, 3], [2, 1]]);
+      assert.ok((fused.get(1) ?? 0) > (fused.get(3) ?? 0));
+      assert.equal(fused.get(3), 1 / (60 + 3));
+    });
+
+    await check('0.8.0 config: resolveSearchMaxBytes clamps; resolveIndexCacheDir lives outside the library', async () => {
+      assert.equal(resolveSearchMaxBytes(undefined), 80_000);
+      assert.equal(resolveSearchMaxBytes(''), 80_000);
+      assert.equal(resolveSearchMaxBytes('abc'), 80_000);
+      assert.equal(resolveSearchMaxBytes('500'), 1_000);
+      assert.equal(resolveSearchMaxBytes('999999999'), 50_000_000);
+      assert.equal(resolveSearchMaxBytes('12345'), 12345);
+      // Per-file content cap: 1 MB default, clamped to [1 KB, 50 MB].
+      assert.equal(resolveIndexMaxFileBytes(undefined), 1_000_000);
+      assert.equal(resolveIndexMaxFileBytes(''), 1_000_000);
+      assert.equal(resolveIndexMaxFileBytes('abc'), 1_000_000);
+      assert.equal(resolveIndexMaxFileBytes('500'), 1_000);
+      assert.equal(resolveIndexMaxFileBytes('999999999'), 50_000_000);
+      assert.equal(resolveIndexMaxFileBytes('2000000'), 2000000);
+      const dir = resolveIndexCacheDir(root);
+      assert.ok(!dir.startsWith(root), 'index cache must be outside the library');
+      assert.match(dir, /[0-9a-f]{16}$/);
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'cache-override');
+      assert.equal(
+        resolveIndexCacheDir(root),
+        path.join(scratch, 'cache-override', dir.split(path.sep).pop()),
+      );
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 placeholder detection: only the real iCloud suffix is skipped', async () => {
+      assert.equal(isPlaceholderFile('notes/x.md.icloud'), true);
+      // `.cloud` / `.onedrive` are not real placeholder markers —
+      // OneDrive placeholders keep their real names — so files
+      // carrying them are ordinary files, not skipped.
+      assert.equal(isPlaceholderFile('notes/x.md.cloud'), false);
+      assert.equal(isPlaceholderFile('notes/x.md.onedrive'), false);
+      assert.equal(isPlaceholderFile('notes/x.md'), false);
+    });
+
+    await check('0.8.0 scanMarkdownImages: Obsidian embeds + reference-style', async () => {
+      const md = [
+        '![a](assets/a.png)',
+        '![[assets/b.png]]',
+        '![[folder/c.png|alt]]',
+        '![d][ref1]',
+        '![e][]',
+        '',
+        '[ref1]: assets/d.png',
+        '[e]: assets/e.png',
+        '![remote](https://example.com/x.png)',
+      ].join('\n');
+      const srcs = scanMarkdownImages(md).map((r) => r.src).sort();
+      assert.deepEqual(srcs, [
+        'assets/a.png',
+        'assets/b.png',
+        'assets/d.png',
+        'assets/e.png',
+        'folder/c.png',
+      ].sort());
+      // Obsidian embeds of notes/PDFs are not images, and a
+      // `#fragment` is not part of the on-disk path.
+      const obs = scanMarkdownImages(
+        '![[Meeting Notes]] ![[spec.pdf]] ![[pic.png#center]] ![[pic.png|alt]]',
+      );
+      assert.deepEqual(obs.map((r) => r.src), ['pic.png']);
+      assert.equal(obs[0].kind, 'obsidian');
+      // `#` / `?` are stripped only for Obsidian embeds: an inline
+      // ref to a literal `C#` directory keeps its path (0.7.0
+      // behavior), while an Obsidian `#anchor` is still dropped.
+      const hashPath = scanMarkdownImages(
+        '![x](notes/C#/pic.png) ![y](assets/q.png?v=2) ![[pic.png#center]] ![[pic.png?x=1]]',
+      );
+      assert.deepEqual(hashPath.map((r) => r.src), [
+        'notes/C#/pic.png',
+        'assets/q.png?v=2',
+        'pic.png',
+      ]);
+      // A reference definition may carry a title.
+      const titled = scanMarkdownImages('![alt][r]\n\n[r]: assets/x.png "title"\n');
+      assert.deepEqual(titled.map((r) => r.src), ['assets/x.png']);
+      assert.equal(titled[0].kind, 'reference');
+    });
+
+    await check('0.8.0 sandbox: Windows reserved names, ADS, trailing dot/space rejected', async () => {
+      assert.throws(() => validateCrossPlatformSegments('notes/NUL.md'), /reserved device/);
+      assert.throws(() => validateCrossPlatformSegments('notes/CON'), /reserved device/);
+      assert.throws(() => validateCrossPlatformSegments('notes/com1.txt'), /reserved device/);
+      assert.throws(() => validateCrossPlatformSegments('notes/a.md:$DATA'), /alternate data stream/);
+      assert.throws(() => validateCrossPlatformSegments('notes/bad.'), /dot or space/);
+      assert.throws(() => validateCrossPlatformSegments('notes/bad '), /dot or space/);
+      assert.throws(() => validateCrossPlatformSegments('//server/share/x.md'), /UNC/);
+      validateCrossPlatformSegments('notes/normal-file.md');
+      validateCrossPlatformSegments('C:/Users/x/memdrive/notes/a.md');
+      const res = await call('save_file', { path: 'notes/NUL.md', content: 'x', mode: 'new' });
+      assert.equal(res.isError, true);
+      assert.match(textOf(res), /reserved device/i);
+    });
+
+    await check('0.8.0 index (class): build, Chinese search, BM25 rank, exact phrase, filters, pagination', async () => {
+      const libDir = path.join(scratch, 'index-unit-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-unit-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(
+        path.join(libDir, 'a.md'),
+        '---\ntags: [工作]\ndate: 2026-01-05\n---\n# 全文检索\n\n全文检索 全文检索 全文检索。记忆库的检索。\n',
+      );
+      await fs.writeFile(
+        path.join(libDir, 'b.md'),
+        '# 随手记\n\n今天只提了一次全文检索。\n',
+      );
+      await fs.writeFile(path.join(libDir, 'c.txt'), '全文检索在纯文本里。\n');
+      await idx.buildAll();
+      assert.equal(idx.getStatus(), 'ready');
+      // Chinese keyword: a.md (3 occurrences) ranks above b.md (1).
+      const res = await idx.search({ keyword: '全文检索' });
+      assert.equal(res.ready, true);
+      assert.ok(res.total >= 2);
+      assert.equal(res.hits[0].path, 'a.md');
+      assert.match(res.hits[0].snippet, /\*\*全文检索\*\*/);
+      // Exact phrase: only chunks containing the whole phrase.
+      const phrase = await idx.search({ keyword: '检索', exactPhrase: '记忆库的检索' });
+      assert.deepEqual(phrase.hits.map((h) => h.path), ['a.md']);
+      // File-type filter.
+      const mdOnly = await idx.search({ keyword: '全文检索', fileTypes: ['.md'] });
+      assert.ok(mdOnly.hits.every((h) => h.path.endsWith('.md')));
+      assert.ok(!mdOnly.hits.some((h) => h.path === 'c.txt'));
+      // Tag filter.
+      const tagged = await idx.search({ keyword: '全文检索', tags: ['工作'] });
+      assert.deepEqual(tagged.hits.map((h) => h.path), ['a.md']);
+      // Date filter (front matter date 2026-01-05).
+      const dated = await idx.search({ keyword: '全文检索', dateFrom: '2026-01-01', dateTo: '2026-01-31' });
+      assert.deepEqual(dated.hits.map((h) => h.path), ['a.md']);
+      // A range after every file's date (b.md/c.txt fall back to
+      // mtime = today) excludes everything.
+      const datedOut = await idx.search({ keyword: '全文检索', dateFrom: '2027-01-01' });
+      assert.equal(datedOut.total, 0);
+      // Pagination.
+      const page1 = await idx.search({ keyword: '全文检索', limit: 1, offset: 0 });
+      const page2 = await idx.search({ keyword: '全文检索', limit: 1, offset: 1 });
+      assert.equal(page1.hits.length, 1);
+      assert.equal(page2.hits.length, 1);
+      assert.notEqual(page1.hits[0].path + page1.hits[0].startOffset, page2.hits[0].path + page2.hits[0].startOffset);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): incremental refresh picks up add/change/delete; placeholder skipped', async () => {
+      const libDir = path.join(scratch, 'index-incr-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-incr-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'one.md'), '# One\n\n苹果香蕉。\n');
+      await idx.buildAll();
+      assert.equal((await idx.search({ keyword: '苹果' })).total, 1);
+      // Add a file: refresh (forced past the throttle) finds it.
+      await fs.writeFile(path.join(libDir, 'two.md'), '# Two\n\n苹果橙子。\n');
+      await idx.refreshIfNeeded(Date.now() + 60_000);
+      assert.equal((await idx.search({ keyword: '苹果' })).total, 2);
+      // Change a file: new content found, old content gone.
+      await fs.writeFile(path.join(libDir, 'one.md'), '# One\n\n葡萄西瓜。\n');
+      await idx.refreshIfNeeded(Date.now() + 120_000);
+      assert.equal((await idx.search({ keyword: '苹果' })).total, 1);
+      assert.equal((await idx.search({ keyword: '葡萄' })).total, 1);
+      // Delete a file: gone from the index.
+      await fs.unlink(path.join(libDir, 'two.md'));
+      await idx.refreshIfNeeded(Date.now() + 180_000);
+      assert.equal((await idx.search({ keyword: '苹果' })).total, 0);
+      // Placeholder file is never indexed.
+      await fs.writeFile(path.join(libDir, 'cloud.md.icloud'), '苹果占位符。\n');
+      await idx.refreshIfNeeded(Date.now() + 240_000);
+      assert.equal((await idx.search({ keyword: '占位符' })).total, 0);
+      // Persist + reload keeps the index.
+      await idx.persist();
+      const idx2 = new LocalSearchIndex(libDir, libDir, backend);
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'ready');
+      assert.equal((await idx2.search({ keyword: '葡萄' })).total, 1);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): diagnostics finds empty, duplicates, broken refs, orphans', async () => {
+      const libDir = path.join(scratch, 'index-diag-lib');
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-diag-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'empty.md'), '');
+      await fs.writeFile(path.join(libDir, 'dup1.md'), '# Same\n\n重复内容。\n');
+      await fs.writeFile(path.join(libDir, 'dup2.md'), '# Same\n\n重复内容。\n');
+      await fs.writeFile(path.join(libDir, 'broken.md'), '# B\n\n![gone](assets/gone.png)\n![[assets/also-gone.png]]\n');
+      await fs.writeFile(path.join(libDir, 'assets', 'orphan.png'), smallPng);
+      // Orphan must be older than the 24h retention: backdate it.
+      const old = new Date(Date.now() - 25 * 3600 * 1000);
+      await fs.utimes(path.join(libDir, 'assets', 'orphan.png'), old, old);
+      await fs.writeFile(path.join(libDir, 'assets', 'used.png'), smallPng);
+      await fs.writeFile(path.join(libDir, 'uses.md'), '# U\n\n![used](assets/used.png)\n');
+      const diag = await idx.scanDiagnostics();
+      assert.deepEqual(diag.emptyFiles, ['empty.md']);
+      assert.equal(diag.duplicateGroups.length, 1);
+      assert.deepEqual(diag.duplicateGroups[0].sort(), ['dup1.md', 'dup2.md']);
+      assert.deepEqual(
+        diag.brokenImageRefs.map((r) => `${r.file}:${r.src}`).sort(),
+        ['broken.md:assets/also-gone.png', 'broken.md:assets/gone.png'],
+      );
+      assert.deepEqual(diag.orphanCandidates, ['assets/orphan.png']);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): __proto__ term does not pollute Object.prototype', async () => {
+      const libDir = path.join(scratch, 'index-proto-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-proto-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'proto.md'), '# Notes\n\n__proto__ constructor prototype pollution test.\n');
+      await idx.buildAll();
+      assert.equal(idx.getStatus(), 'ready');
+      // The old code wrote the per-chunk map into Object.prototype
+      // itself, so every fresh object gained a stray '0' key.
+      assert.equal(Object.prototype.hasOwnProperty('0'), false);
+      assert.equal(({})['0'], undefined);
+      assert.equal((await idx.search({ keyword: '__proto__' })).total, 1);
+      assert.equal((await idx.search({ keyword: 'constructor' })).total, 1);
+      // And the term survives a persist + reload.
+      await idx.persist();
+      const idx2 = new LocalSearchIndex(libDir, libDir, backend);
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'ready');
+      assert.equal((await idx2.search({ keyword: 'constructor' })).total, 1);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): filename substring search; single-char noise', async () => {
+      const libDir = path.join(scratch, 'index-names-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-names-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'memdrive-notes.md'), '# Notes\n\nSome content here.\n');
+      await fs.writeFile(path.join(libDir, 'shot.png'), smallPng);
+      await fs.writeFile(path.join(libDir, 'a.md'), '用户开户流程。\n');
+      await fs.writeFile(path.join(libDir, 'b.md'), '存款证明材料。\n');
+      await fs.writeFile(path.join(libDir, 'c.md'), '户\n');
+      await idx.buildAll();
+      // Substring of a filename finds the file even when the
+      // content does not contain it (0.7.0 behavior).
+      const memdr = await idx.search({ keyword: 'memdr' });
+      assert.ok(memdr.hits.some((h) => h.path === 'memdrive-notes.md'));
+      const shot = await idx.search({ keyword: 'shot' });
+      assert.ok(shot.hits.some((h) => h.path === 'shot.png'));
+      // A multi-character Chinese query does not match a note that
+      // only holds one of its characters.
+      const noise = await idx.search({ keyword: '用户存款' });
+      assert.ok(!noise.hits.some((h) => h.path === 'c.md'));
+      assert.ok(noise.hits.some((h) => h.path === 'a.md'));
+      assert.ok(noise.hits.some((h) => h.path === 'b.md'));
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): CJK query split into single chars finds the word, not the particles', async () => {
+      const libDir = path.join(scratch, 'index-cjk-noise-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-cjk-noise-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'a.md'), '# A\n\n他说了很多话。\n');
+      await fs.writeFile(path.join(libDir, 'b.md'), '# B\n\n今天了解了全文检索的用法。\n');
+      await fs.writeFile(path.join(libDir, 'c.md'), '# C\n\n我们有了新的想法。\n');
+      await idx.buildAll();
+      // 说了 segments into 说 / 了 on this runtime: before the fix
+      // the OR over particles hit all three notes.
+      const said = await idx.search({ keyword: '说了' });
+      assert.deepEqual(said.hits.map((h) => h.path), ['a.md']);
+      const saw = await idx.search({ keyword: '看了' });
+      assert.equal(saw.total, 0);
+      // A one-character query still searches the character itself.
+      const le = await idx.search({ keyword: '了' });
+      assert.ok(le.total >= 2);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): one hit per file; highlight survives long slices', async () => {
+      const libDir = path.join(scratch, 'index-dedup-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-dedup-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      let long = '# 长笔记\n\n';
+      for (let i = 0; i < 30; i++) {
+        long += `第${i}段检索内容，重复出现的检索词。\n\n`;
+      }
+      await fs.writeFile(path.join(libDir, 'long.md'), long);
+      await fs.writeFile(path.join(libDir, 'short.md'), '检索一次。\n');
+      await idx.buildAll();
+      const res = await idx.search({ keyword: '检索' });
+      assert.equal(res.total, 2, 'total counts files, not chunks');
+      assert.equal(res.hits.filter((h) => h.path === 'long.md').length, 1);
+      // Highlight: many `……` before the match used to collapse the
+      // snippet to a bare `…`.
+      const longSlice = '……'.repeat(100) + '这里是匹配词出现的位置，后面还有一些文字内容。';
+      const snippet = highlightSnippet(longSlice, ['匹配词'], '匹配词');
+      assert.ok(snippet.includes('**匹配词**'), snippet);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): date bounds cover the whole day; bad dates fail', async () => {
+      const libDir = path.join(scratch, 'index-dates-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-dates-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'dated.md'), '---\ndate: 2026-11-08T15:30:00Z\n---\n\ndated content here.\n');
+      await idx.buildAll();
+      // dateTo on the same day includes a note dated that afternoon.
+      const same = await idx.search({ keyword: 'dated', dateTo: '2026-11-08' });
+      assert.equal(same.total, 1);
+      const before = await idx.search({ keyword: 'dated', dateTo: '2026-11-07' });
+      assert.equal(before.total, 0);
+      // An unparseable date is an error, not a silently ignored filter.
+      await assert.rejects(idx.search({ keyword: 'dated', dateFrom: 'garbage' }), /Invalid date/);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): damaged index file rebuilds instead of failing every search', async () => {
+      const libDir = path.join(scratch, 'index-corrupt-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      const cacheDir = path.join(scratch, 'index-corrupt-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'note.md'), 'hello corrupt world\n');
+      await idx.buildAll();
+      assert.equal(idx.getStatus(), 'ready');
+      // Corrupt the persisted index: parses, but has no files/postings.
+      const dir = resolveIndexCacheDir(libDir);
+      await fs.writeFile(path.join(dir, 'index.json'), '{"version":2,"chunks":[]}');
+      const idx2 = new LocalSearchIndex(libDir, libDir, backend);
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'unbuilt');
+      const res = await idx2.search({ keyword: 'hello' });
+      assert.equal(res.ready, false);
+      // Rebuild (the handler triggers it on an unbuilt index).
+      await idx2.ensureReady();
+      assert.equal(idx2.getStatus(), 'ready');
+      assert.equal((await idx2.search({ keyword: 'hello' })).total, 1);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): oversized .log is indexed by filename only', async () => {
+      const libDir = path.join(scratch, 'index-biglog-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-biglog-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      const line = 'ERROR 2026-11-08 something happened in the system log line\n';
+      await fs.writeFile(path.join(libDir, 'app.log'), line.repeat(40000));
+      await fs.writeFile(path.join(libDir, 'note.md'), 'small note\n');
+      const t0 = Date.now();
+      await idx.buildAll();
+      const took = Date.now() - t0;
+      assert.ok(took < 10000, `build took ${took} ms`);
+      // Content words from the log are NOT indexed; the filename is.
+      assert.equal((await idx.search({ keyword: 'something' })).total, 0);
+      const byName = await idx.search({ keyword: 'app' });
+      assert.ok(byName.hits.some((h) => h.path === 'app.log'));
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): bulk refresh stays incremental and correct', async () => {
+      const libDir = path.join(scratch, 'index-bulk-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-bulk-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      const vocab = [];
+      for (let i = 0; i < 200; i++) vocab.push(`word${i}`);
+      for (let n = 0; n < 200; n++) {
+        const words = [];
+        for (let w = 0; w < 20; w++) words.push(vocab[(n + w) % vocab.length]);
+        const extra = n === 100 ? ' onlyinnote100' : '';
+        await fs.writeFile(path.join(libDir, `note-${n}.md`), `# Note ${n}\n${words.join(' ')}${extra}\n`);
+      }
+      await idx.buildAll();
+      for (let n = 0; n < 50; n++) {
+        await fs.writeFile(path.join(libDir, `note-${n}.md`), `# Note ${n} updated\nchanged content uniqueword${n}\n`);
+      }
+      await fs.unlink(path.join(libDir, 'note-100.md'));
+      const t0 = Date.now();
+      await idx.refreshIfNeeded(Date.now() + 60_000);
+      const took = Date.now() - t0;
+      assert.ok(took < 10000, `refresh took ${took} ms`);
+      assert.equal((await idx.search({ keyword: 'changed' })).total, 50);
+      assert.equal((await idx.search({ keyword: 'uniqueword7' })).total, 1);
+      assert.equal((await idx.search({ keyword: 'onlyinnote100' })).total, 0);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): mtime-only change does not re-index', async () => {
+      const libDir = path.join(scratch, 'index-mtime-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-mtime-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'one.md'), '# One\n\n苹果香蕉。\n');
+      await idx.buildAll();
+      // Touch the mtime only (sync tools do this): content is
+      // identical, so the file must stay searchable as before.
+      const future = new Date(Date.now() + 3600 * 1000);
+      await fs.utimes(path.join(libDir, 'one.md'), future, future);
+      await idx.refreshIfNeeded(Date.now() + 60_000);
+      assert.equal((await idx.search({ keyword: '苹果' })).total, 1);
+      assert.equal((await idx.search({ keyword: '香蕉' })).total, 1);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): diagnostics resolves Obsidian embeds vault-wide, ignores outside symlinks', async () => {
+      const libDir = path.join(scratch, 'index-diag2-lib');
+      await fs.mkdir(path.join(libDir, 'attachments'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-diag2-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'pic-note.md'), '# P\n\nsee ![[pic.png]]\n');
+      await fs.writeFile(path.join(libDir, 'attachments', 'pic.png'), smallPng);
+      const old = new Date(Date.now() - 25 * 3600 * 1000);
+      await fs.utimes(path.join(libDir, 'attachments', 'pic.png'), old, old);
+      await fs.writeFile(path.join(libDir, 'dup1.md'), '# Same\n\n重复内容。\n');
+      await fs.writeFile(path.join(libDir, 'dup2.md'), '# Same\n\n重复内容。\n');
+      // Symlink to a directory outside the library, holding an old image.
+      const outsideDir = path.join(scratch, 'index-diag2-outside');
+      await fs.mkdir(outsideDir, { recursive: true });
+      await fs.writeFile(path.join(outsideDir, 'private-photo.png'), smallPng);
+      await fs.utimes(path.join(outsideDir, 'private-photo.png'), old, old);
+      await fs.symlink(outsideDir, path.join(libDir, 'link'));
+      await idx.buildAll();
+      const diag = await idx.scanDiagnostics();
+      // The Obsidian embed resolves vault-wide: not broken, not orphan.
+      assert.deepEqual(diag.brokenImageRefs, []);
+      assert.deepEqual(diag.orphanCandidates, []);
+      // Duplicates are still found when the index is ready (hashes reused).
+      assert.equal(diag.duplicateGroups.length, 1);
+      assert.deepEqual(diag.duplicateGroups[0].sort(), ['dup1.md', 'dup2.md']);
+      // The outside file never leaks into the report.
+      assert.ok(!JSON.stringify(diag).includes('private-photo'));
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): diagnostics resolves path-style Obsidian embeds from the vault root; inline # paths stay literal', async () => {
+      const libDir = path.join(scratch, 'index-diag3-lib');
+      await fs.mkdir(path.join(libDir, 'notes/deep'), { recursive: true });
+      await fs.mkdir(path.join(libDir, 'attachments'), { recursive: true });
+      await fs.mkdir(path.join(libDir, 'notes/C#'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-diag3-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      // B: nested note, vault-root embed.
+      await fs.writeFile(path.join(libDir, 'notes/deep/a.md'), '# A\n\n![[attachments/pic.png]]\n');
+      await fs.writeFile(path.join(libDir, 'attachments/pic.png'), smallPng);
+      // B (suffix): the embed names a path tail, not the full vault path.
+      await fs.writeFile(path.join(libDir, 'notes/deep/b.md'), '# B\n\n![[deep/pic2.png]]\n');
+      await fs.mkdir(path.join(libDir, 'assets/deep'), { recursive: true });
+      await fs.writeFile(path.join(libDir, 'assets/deep/pic2.png'), smallPng);
+      // C: inline ref to a literal `#` directory.
+      await fs.writeFile(path.join(libDir, 'c.md'), '# C\n\n![x](notes/C#/pic.png)\n');
+      await fs.writeFile(path.join(libDir, 'notes/C#/pic.png'), smallPng);
+      const old = new Date(Date.now() - 25 * 3600 * 1000);
+      for (const p of ['attachments/pic.png', 'assets/deep/pic2.png', 'notes/C#/pic.png']) {
+        await fs.utimes(path.join(libDir, p), old, old);
+      }
+      await idx.buildAll();
+      const diag = await idx.scanDiagnostics();
+      assert.deepEqual(diag.brokenImageRefs, []);
+      assert.deepEqual(diag.orphanCandidates, []);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): diagnostics never reads a dataless cloud file', async () => {
+      const libDir = path.join(scratch, 'index-dataless-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-dataless-cache');
+      // Simulate macOS: cloud.md and cloud-dup.md report as dataless
+      // (on Linux the platform gate never triggers, so the check is
+      // overridden here to exercise the skip itself).
+      class DatalessIndex extends LocalSearchIndex {
+        async isDatalessFile(relPath) {
+          return relPath === 'cloud.md' || relPath === 'cloud-dup.md';
+        }
+      }
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new DatalessIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'cloud.md'), '# Cloud\n\n![[missing.png]]\n\n重复内容。\n');
+      await fs.writeFile(path.join(libDir, 'plain.md'), '# Plain\n\n重复内容。\n');
+      await fs.writeFile(path.join(libDir, 'cloud-dup.md'), '# Plain\n\n重复内容。\n');
+      await idx.buildAll();
+      // Name-only indexing still works: the file is findable.
+      const found = await idx.search({ keyword: 'cloud' });
+      assert.ok(found.hits.some((h) => h.path === 'cloud.md'));
+      const diag = await idx.scanDiagnostics();
+      // Had diagnostics read cloud.md, its broken ref would show;
+      // had it hashed cloud-dup.md, it would duplicate plain.md.
+      assert.deepEqual(diag.brokenImageRefs, []);
+      assert.deepEqual(diag.duplicateGroups, []);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 index (class): two instances building at once do not corrupt the shared index', async () => {
+      const libDir = path.join(scratch, 'index-concurrent-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-concurrent-cache');
+      await fs.writeFile(path.join(libDir, 'a.md'), '# A\n\n全文检索测试。\n');
+      await fs.writeFile(path.join(libDir, 'b.md'), '# B\n\n另一篇笔记。\n');
+      const idx1 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      const idx2 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      const [r1, r2] = await Promise.all([idx1.buildAll(), idx2.buildAll()]);
+      assert.ok(r1 || r2, 'at least one build wins the lock');
+      // The persisted index loads cleanly afterwards.
+      const idx3 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      await idx3.load();
+      assert.equal(idx3.getStatus(), 'ready');
+      assert.ok((await idx3.search({ keyword: '全文检索' })).hits.some((h) => h.path === 'a.md'));
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 search_files (handler): fallback applies file types and says what it ignores; diagnostics needs no keyword', async () => {
+      const libDir = path.join(scratch, 'index-fallback-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-fallback-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'a.md'), '全文检索 in markdown.\n');
+      await fs.writeFile(path.join(libDir, 'b.txt'), '全文检索 in text.\n');
+      const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+      // Index never built: every search falls back to a direct scan.
+      const res = await handleSearchFiles(ctx, '全文检索', '', {
+        fileTypes: ['.md'],
+        tags: ['工作'],
+        exactPhrase: '全文检索',
+        limit: 20,
+        offset: 0,
+      });
+      const text = textOf(res);
+      assert.match(text, /direct scan/);
+      assert.match(text, /a\.md/);
+      assert.doesNotMatch(text, /b\.txt/);
+      assert.match(text, /NOT applied/);
+      // diagnostics_only works without a keyword.
+      const diag = await handleSearchFiles(ctx, '', '', { diagnosticsOnly: true });
+      assert.match(textOf(diag), /Library diagnostics/);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.0 search_files (MCP): Chinese keyword, filters, pagination, diagnostics_only', async () => {
+      await call('save_file', {
+        path: 'search8/a.md',
+        content: '---\ntags: [工作]\ndate: 2026-03-10\n---\n# 全文检索实测\n\n全文检索 全文检索。记忆库的检索速度很快。\n',
+        mode: 'new',
+      });
+      await call('save_file', {
+        path: 'search8/b.md',
+        content: '# 随手记\n\n今天只提了一次全文检索。\n',
+        mode: 'new',
+      });
+      await call('save_file', {
+        path: 'search8/c.txt',
+        content: '全文检索在纯文本里。\n',
+        mode: 'new',
+      });
+      const res = await call('search_files', { keyword: '全文检索', rebuild_index: true });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /search8\/a\.md/);
+      assert.match(textOf(res), /\*\*全文检索\*\*/);
+      const tagged = await call('search_files', { keyword: '全文检索', tags: ['工作'] });
+      assert.match(textOf(tagged), /search8\/a\.md/);
+      assert.doesNotMatch(textOf(tagged), /search8\/b\.md/);
+      const mdOnly = await call('search_files', { keyword: '全文检索', file_types: ['.md'] });
+      assert.doesNotMatch(textOf(mdOnly), /search8\/c\.txt/);
+      const phrase = await call('search_files', { keyword: '检索', exact_phrase: '检索速度很快' });
+      assert.match(textOf(phrase), /search8\/a\.md/);
+      assert.doesNotMatch(textOf(phrase), /search8\/b\.md/);
+      const page = await call('search_files', { keyword: '全文检索', limit: 1, offset: 0 });
+      assert.match(textOf(page), /showing 1–1/);
+      assert.match(textOf(page), /More results available/);
+      const diag = await call('search_files', { keyword: 'x', diagnostics_only: true });
+      assert.equal(diag.isError, undefined, textOf(diag));
+      assert.match(textOf(diag), /Library diagnostics \(read-only/);
+      assert.match(textOf(diag), /Empty files/);
+    });
+
+    await check('0.8.0 search_files (MCP): save then search without rebuild; synced-in names still read', async () => {
+      await call('save_file', {
+        path: 'search8/d.md',
+        content: '# 新笔记\n\n现搜现得的内容。\n',
+        mode: 'new',
+      });
+      // No rebuild_index: the save must make the note searchable at once.
+      const res = await call('search_files', { keyword: '现搜现得' });
+      assert.match(textOf(res), /search8\/d\.md/);
+      // Files synced in under cross-platform-unfriendly names still read.
+      await fs.writeFile(path.join(root, 'meeting 10:30.md'), '# Meeting\n\ncolon name.\n');
+      await fs.writeFile(path.join(root, 'aux.notes.md'), '# Aux\n\nreserved name.\n');
+      const colon = await call('read_file', { path: 'meeting 10:30.md' });
+      assert.equal(colon.isError, undefined, textOf(colon));
+      assert.match(textOf(colon), /colon name/);
+      const aux = await call('read_file', { path: 'aux.notes.md' });
+      assert.equal(aux.isError, undefined, textOf(aux));
+      // ... and saving under such a name is still refused (write check stays).
+      const bad = await call('save_file', { path: 'meeting 10:31.md', content: 'x', mode: 'new' });
+      assert.equal(bad.isError, true);
+      // diagnostics_only works without a keyword.
+      const diagNoKw = await call('search_files', { diagnostics_only: true });
+      assert.equal(diagNoKw.isError, undefined, textOf(diagNoKw));
+      assert.match(textOf(diagNoKw), /Library diagnostics \(read-only/);
+    });
+
   } finally {
     await client.close().catch(() => undefined);
     await transport.close().catch(() => undefined);

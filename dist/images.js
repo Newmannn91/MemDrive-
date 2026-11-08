@@ -435,9 +435,11 @@ export async function makePreview(data, mimeType, maxBytes = IMAGE_PREVIEW_MAX_B
     }
 }
 /**
- * Scan markdown for locally-referenced images: inline `![alt](src)` and
- * `<img src="...">`. Remote URLs (http/https), data: URIs, and fragments
- * are skipped — only files that could live next to the document.
+ * Scan markdown for locally-referenced images: inline `![alt](src)`,
+ * `<img src="...">`, Obsidian embeds `![[src]]` / `![[src|alt]]`, and
+ * reference-style `![alt][id]` with `[id]: src` definitions. Remote
+ * URLs (http/https), data: URIs, and fragments are skipped — only
+ * files that could live next to the document.
  */
 /**
  * Percent-encode characters in a Markdown image src that would break
@@ -459,8 +461,25 @@ export function encodeImageSrc(src) {
 export function scanMarkdownImages(markdown) {
     const refs = [];
     const seen = new Set();
-    const push = (src) => {
+    const push = (src, kind) => {
         let trimmed = src.trim();
+        // A raw `#fragment` or `?query` is not part of the on-disk path
+        // — but ONLY for Obsidian embeds (`![[pic.png#center]]` refers
+        // to `pic.png`; `#` there is an anchor, not a filename). Inline,
+        // `<img>`, and reference-style refs keep 0.7.0 behavior: the path
+        // is literal, so `notes/C#/pic.png` stays `notes/C#/pic.png`.
+        // Strip BEFORE decoding: a `#` that belongs to the filename
+        // arrives percent-encoded (`%23`) and must survive the strip.
+        if (kind === 'obsidian') {
+            const hashAt = trimmed.indexOf('#');
+            if (hashAt !== -1) {
+                trimmed = trimmed.slice(0, hashAt).trim();
+            }
+            const queryAt = trimmed.indexOf('?');
+            if (queryAt !== -1) {
+                trimmed = trimmed.slice(0, queryAt).trim();
+            }
+        }
         // Newly saved notes carry percent-encoded refs; decode them back
         // to the on-disk path. A bad escape falls back to the raw src.
         try {
@@ -469,28 +488,63 @@ export function scanMarkdownImages(markdown) {
         catch {
             // Keep the raw src.
         }
+        // Obsidian embeds can point at notes and PDFs too (`![[Meeting
+        // Notes]]`, `![[spec.pdf]]`): only image extensions are image
+        // references, the rest must not reach read_file's image path.
+        if (kind === 'obsidian' && mimeFromExtension(trimmed) === null) {
+            return;
+        }
         if (trimmed.length === 0 ||
-            seen.has(trimmed) ||
+            seen.has(`${kind}:${trimmed}`) ||
             /^https?:\/\//i.test(trimmed) ||
             trimmed.startsWith('data:') ||
             trimmed.startsWith('#')) {
             return;
         }
-        seen.add(trimmed);
-        refs.push({ src: trimmed });
+        seen.add(`${kind}:${trimmed}`);
+        refs.push({ src: trimmed, kind });
     };
     const inlinePattern = /!\[[^\]]*\]\(\s*([^\s)]+)(?:\s+"[^"]*")?\s*\)/g;
     for (const match of markdown.matchAll(inlinePattern)) {
         const src = match[1];
         if (src !== undefined) {
-            push(src);
+            push(src, 'inline');
         }
     }
     const imgPattern = /<img\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/gi;
     for (const match of markdown.matchAll(imgPattern)) {
         const src = match[1] ?? match[2] ?? match[3];
         if (src !== undefined) {
-            push(src);
+            push(src, 'img');
+        }
+    }
+    // Obsidian embeds: `![[path.png]]` and `![[folder/img.png|alt]]`.
+    const obsidianPattern = /!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+    for (const match of markdown.matchAll(obsidianPattern)) {
+        const src = match[1];
+        if (src !== undefined) {
+            push(src, 'obsidian');
+        }
+    }
+    // Reference-style: collect `[id]: src` definitions first, then
+    // resolve `![alt][id]` (and collapsed `![id][]`, where id = alt).
+    // A definition may carry an optional title: `[id]: src "title"`.
+    const refDefs = new Map();
+    for (const match of markdown.matchAll(/^\s*\[([^\]]+)\]:\s*(\S+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/gm)) {
+        const id = match[1];
+        const src = match[2];
+        if (id !== undefined && src !== undefined) {
+            refDefs.set(id.toLowerCase(), src);
+        }
+    }
+    const refPattern = /!\[[^\]]*\]\[([^\]]*)\]/g;
+    for (const match of markdown.matchAll(refPattern)) {
+        const idRaw = match[1];
+        const altMatch = /^!\[([^\]]*)\]/.exec(match[0]);
+        const id = idRaw.length > 0 ? idRaw : (altMatch?.[1] ?? '');
+        const src = refDefs.get(id.toLowerCase());
+        if (src !== undefined) {
+            push(src, 'reference');
         }
     }
     return refs;

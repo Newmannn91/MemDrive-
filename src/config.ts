@@ -6,6 +6,7 @@
  * Units are decimal bytes throughout (1 MB = 1,000,000 bytes), matching how
  * the vendor docs state their caps.
  */
+import crypto from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -190,4 +191,140 @@ export function resolveRootDir(): string {
         ? path.join(homedir(), configured.slice(2).replace(/\\/g, '/'))
         : configured;
   return path.resolve(expanded);
+}
+
+/* ------------------------------------------------------------------ */
+/* 0.8.0 search engine                                                 */
+/* ------------------------------------------------------------------ */
+
+/** Maximum characters in one index chunk (heading/paragraph based). */
+export const SEARCH_CHUNK_MAX_CHARS = 600;
+
+/** Overlap (characters) between consecutive index chunks. */
+export const SEARCH_CHUNK_OVERLAP_CHARS = 100;
+
+/** Okapi BM25 term-frequency saturation. */
+export const BM25_K1 = 1.2;
+
+/** Okapi BM25 length-normalization strength. */
+export const BM25_B = 0.75;
+
+/** Reciprocal rank fusion constant (1 / (k + rank)). */
+export const RRF_K = 60;
+
+/** On-disk index format version; a mismatch triggers a rebuild. */
+export const INDEX_FORMAT_VERSION = 2;
+
+/** Age after which a lock file is treated as stale and may be stolen. */
+export const INDEX_LOCK_TIMEOUT_MS = 30_000;
+
+/** Minimum time between incremental refresh stat scans. */
+export const INDEX_REFRESH_MIN_INTERVAL_MS = 5_000;
+
+/** Minimum age before an unreferenced attachment is an orphan candidate. */
+export const ORPHAN_MIN_RETENTION_MS = 24 * 3600 * 1000;
+
+/** Default cap on one file's content indexed (bytes); larger files are indexed by filename only. */
+export const INDEX_MAX_FILE_BYTES_DEFAULT = 1_000_000;
+
+/** Smallest content cap the environment variable may set. */
+export const INDEX_MAX_FILE_BYTES_MIN = 1_000;
+
+/** Largest content cap the environment variable may set. */
+export const INDEX_MAX_FILE_BYTES_MAX = 50_000_000;
+
+/**
+ * Resolve the per-file content cap from a raw environment-variable
+ * value. Unset, empty, or non-numeric values fall back to the
+ * default; out-of-range values are clamped to [MIN, MAX]. Pure
+ * function of its argument so the clamping rules are directly
+ * unit-testable.
+ */
+export function resolveIndexMaxFileBytes(rawValue: string | undefined): number {
+  const trimmed = rawValue?.trim() ?? '';
+  if (trimmed.length === 0) {
+    return INDEX_MAX_FILE_BYTES_DEFAULT;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return INDEX_MAX_FILE_BYTES_DEFAULT;
+  }
+  const floored = Math.floor(parsed);
+  if (floored < INDEX_MAX_FILE_BYTES_MIN) {
+    return INDEX_MAX_FILE_BYTES_MIN;
+  }
+  if (floored > INDEX_MAX_FILE_BYTES_MAX) {
+    return INDEX_MAX_FILE_BYTES_MAX;
+  }
+  return floored;
+}
+
+/** Default cap on search_files result text (bytes). */
+export const SEARCH_MAX_BYTES_DEFAULT = 80_000;
+
+/** Smallest search output cap the environment variable may set. */
+export const SEARCH_MAX_BYTES_MIN = 1_000;
+
+/** Largest search output cap the environment variable may set. */
+export const SEARCH_MAX_BYTES_MAX = 50_000_000;
+
+/**
+ * Resolve the search output cap from a raw environment-variable value.
+ * Unset, empty, or non-numeric values fall back to the default;
+ * out-of-range values are clamped to [MIN, MAX]. Pure function of its
+ * argument so the clamping rules are directly unit-testable.
+ */
+export function resolveSearchMaxBytes(rawValue: string | undefined): number {
+  const trimmed = rawValue?.trim() ?? '';
+  if (trimmed.length === 0) {
+    return SEARCH_MAX_BYTES_DEFAULT;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return SEARCH_MAX_BYTES_DEFAULT;
+  }
+  const floored = Math.floor(parsed);
+  if (floored < SEARCH_MAX_BYTES_MIN) {
+    return SEARCH_MAX_BYTES_MIN;
+  }
+  if (floored > SEARCH_MAX_BYTES_MAX) {
+    return SEARCH_MAX_BYTES_MAX;
+  }
+  return floored;
+}
+
+/**
+ * Resolve the directory that holds this library's search index.
+ *
+ * The index lives OUTSIDE the library (it is a cache, not data): under
+ * the OS cache dir, in a subdir named by the first 16 hex chars of the
+ * SHA-256 of the library's real path, so two libraries never share an
+ * index and the cache never appears as a note. `MEMDRIVE_CACHE_DIR`
+ * overrides the base cache dir.
+ */
+export function resolveIndexCacheDir(rootRealDir: string): string {
+  const override = process.env['MEMDRIVE_CACHE_DIR']?.trim();
+  let base: string;
+  if (override !== undefined && override.length > 0) {
+    base = override;
+  } else if (process.platform === 'win32') {
+    base =
+      process.env['LOCALAPPDATA'] ??
+      process.env['APPDATA'] ??
+      path.join(homedir(), '.cache');
+    base = path.join(base, 'memdrive-mcp');
+  } else if (process.platform === 'darwin') {
+    base = path.join(homedir(), 'Library', 'Caches', 'memdrive-mcp');
+  } else {
+    base = path.join(
+      process.env['XDG_CACHE_HOME'] ?? path.join(homedir(), '.cache'),
+      'memdrive-mcp',
+    );
+  }
+  const subdir = crypto
+    .createHash('sha256')
+    .update(rootRealDir)
+    .digest('hex')
+    .slice(0, 16);
+  return path.join(base, subdir);
 }

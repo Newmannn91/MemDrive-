@@ -1337,3 +1337,231 @@ What is NOT covered by the automated suite (stated plainly):
   rebinding, full-width space image refs, `"BM"`/`"GIF8"` text notes,
   atomicWrite mode/symlink/read-only/retry, and `mode: 'new'`
   pre-check).
+
+### 0.8.0 search engine (2026-11-08)
+
+Writer: Muse (VM, direct file writes + VM verification — no
+Gemini/Argon sandbox involved, so the 0.8.0 Argon packaging crash
+does not apply). Review: Sonnet (full package, 2026-11-08 17:33)
++ ChatGPT (pending). Every Sonnet finding was verified against
+the code and by live reproduction before fixing; the review
+round is described below.
+
+VM verification (2026-11-08, Node v24.22.1):
+
+- `npm run build` clean (strict incl. `noUncheckedIndexedAccess`).
+- `npm test` **125/125 checks passed** (98 from 0.7.0 + 27
+  0.8.0 checks: the original 12, plus 11 added in the first
+  review round, plus 4 added in the second review round: a CJK
+  query split into single characters (说了) finds the word, not
+  the particles; diagnostics resolve path-style Obsidian embeds
+  from the vault root and keep inline `#` paths literal;
+  diagnostics never read a dataless cloud file (simulated by
+  overriding the macOS check in a subclass); two index
+  instances building at once do not corrupt the shared index).
+  The 12 original checks: tokenizer (Chinese
+  segmentation, bigram, single char, mixed, NFKC, no double-count
+  of 1–2 char words), chunker (exact offsets, 600 cap, 100 overlap,
+  sections), tags/date extraction (front matter > filename >
+  mtime), BM25 + RRF sanity, config clamping + index cache dir
+  (outside the library, hashed subdir, override), placeholder
+  detection, `scanMarkdownImages` Obsidian + reference-style,
+  sandbox cross-platform rejection (reserved names, ADS, trailing
+  dot/space, UNC), index class end-to-end (build, Chinese search,
+  BM25 rank, exact phrase, filters, pagination), incremental
+  refresh (add/change/delete, placeholder skipped, persist +
+  reload), diagnostics (empty, duplicates, broken refs, orphans),
+  and `search_files` over MCP (Chinese keyword, filters,
+  pagination, `diagnostics_only`). The 11 review-round checks:
+  `__proto__` does not pollute (and a persisted index still
+  finds `constructor` after reload), filename-substring search
+  (`memdr`/`shot.png`) with single-character noise rejected, one
+  hit per file + `total` counts files, snippet highlighting
+  survives long-text truncation, date-only upper bound covers
+  the whole day + an invalid date is an error, a damaged index
+  (`{"version":2,"chunks":[]}`) loads as unbuilt and rebuilds,
+  a 2.4 MB `.log` is indexed by name only, bulk refresh of 200
+  changed files in 5,000 (plus a deletion) is correct, an
+  mtime-only change does not re-index, diagnostics resolve
+  Obsidian embeds library-wide and do not leak through an outside
+  symlink, and the direct-scan fallback applies `file_types` and
+  says which filters it did not apply (plus `diagnostics_only`
+  without a keyword over MCP).
+- Three failures found and fixed during verification (all in the
+  new code/tests, none in 0.7.0 behavior):
+  1. `highlightSnippet` re-wrapped terms char by char (nested
+     asterisks), so the snippet never contained `**全文检索**`.
+     Fixed with a single combined regex pass, longest candidate
+     first, including the raw query as a candidate.
+  2. The symlink-leak regression test used the hyphenated
+     identifier `TOP-SECRET-OUTSIDE-ROOT` as a plain keyword; the
+     0.8.0 tokenizer splits it into four terms and OR-matches any
+     of them, so an inside file containing `root` matched. This is
+     correct search-engine behavior (OR + ranking), not a leak.
+     The test now searches for the single unique term `ZQXJ`,
+     which occurs only in the outside file.
+  3. A date-filter test expected 0 results for
+     `dateFrom: '2026-02-01'`, but files without a front matter /
+     filename date fall back to mtime (= today), which is after
+     that date. The test now uses a future `dateFrom` (2027-01-01).
+- One test updated for the new output format: `search_files
+  matches by name and by content` no longer asserts the 0.7.0
+  `(name)` / `(content)` kind labels (gone in the ranked-file
+  format); it asserts the file paths appear, which holds for both
+  the index path and the direct-scan fallback.
+- Two tests updated for behavior the review showed was wrong
+  rather than merely untested: the placeholder test now expects
+  only the `.icloud` suffix to be skipped (`.cloud` /
+  `.onedrive` were never real placeholder markers), and the
+  chunker test asserts every chunk is ≤ 600 chars including
+  blank-line-separated paragraphs.
+
+Review round (Sonnet, 2026-11-08 17:33 — 3 severe, 17 medium,
+minor items, test gaps, and two CHANGELOG overstatements; all
+reproduced live before fixing, then re-verified with the
+reproduction scripts and the new tests):
+
+- Severe: `__proto__` as an indexed term polluted
+  `Object.prototype` (null-prototype maps now); bulk updates
+  were 5× slower than a full rebuild (per-file term lists +
+  a chunk-id counter + a rebuild threshold, now faster than
+  rebuild below the threshold); a 60 MB `.log` blocked the
+  server for ~12 s and wrote a 31 MB index (1 MB content cap
+  + `.log`/`.csv`/`.json` indexed by name only: 31 ms, 714 B).
+- Medium: save-then-search latency (save marks the file dirty,
+  the next search refreshes first); sandbox validation moved to
+  writes only (reads keep 0.7.0 behavior, so `meeting 10:30.md`
+  and `aux.notes.md` open again); Obsidian images no longer
+  reported both broken and orphaned; non-image Obsidian embeds
+  and `#fragment` handled; reference definitions with titles
+  and `.markdown` files scanned; filename-substring search
+  restored and single-character noise filtered; one hit per
+  file with `total` counting files; snippet offsets measured on
+  the original text; a damaged index rebuilds instead of failing
+  every search; query-time refresh no longer blocks on the stat
+  scan; the direct-scan fallback applies file types and reports
+  unapplied filters; output fitting no longer truncates the
+  "More" line or skips results; the walk cannot escape through a
+  symlink; diagnostics reuse index hashes; date-only upper
+  bounds cover the whole day and invalid dates error; tags no
+  longer yield a bogus `- alpha` and `#a/b` stays whole;
+  placeholder detection reduced to the real `.icloud` suffix
+  plus the macOS dataless check.
+- Two further bugs found while re-running the benchmark after
+  the fixes: a refresh requested during a running refresh could
+  return having seen none of the new files (joiners now queue a
+  follow-up pass; background query refreshes join without
+  queueing), and the refresh itself was slow on 10k files
+  (~5 s: realpath per file, a full chunks-array scan per
+  removed file, `Object.keys` on hot terms' postings maps, and
+  the disk write blocking the search). Fixed by using the
+  directory listing's own stat + symlink flag, filtering the
+  chunks array once per refresh, a per-term entry count for
+  O(1) emptiness, and writing the index in the background
+  (the index is a rebuildable cache; a lost write self-heals
+  on the next refresh). Incremental refresh is now ~0.67 s.
+- CHANGELOG: the "SearchIndex interface" and "scanDiagnostics"
+  lines were written before the code had them — the interface
+  and the renamed method now exist; the "never triggers a cloud
+  download" claim was corrected (Windows OneDrive placeholders
+  carry no detectable marker); "keep working exactly as in
+  0.7.0" was qualified (calling format compatible, results are
+  ranked files, not the 0.7.0 name/content list).
+
+Second review round (Sonnet, 2026-11-08 19:00 — 4 medium, 4
+low-priority; all reproduced live before fixing, then
+re-verified with the reproduction scripts and the new tests):
+
+- Medium, all fixed: a CJK query the segmenter splits into
+  single characters only (说了 -> 说 / 了) matched every note
+  containing the particles — the query's CJK run must now appear
+  verbatim in the chunk (an implicit exact phrase); path-style
+  Obsidian embeds (`![[attachments/pic.png]]`) were resolved
+  note-relative instead of vault-root — they now try the vault
+  root, then the note's directory, then a path-suffix match;
+  `#` / `?` were stripped for every reference type, breaking
+  literal paths such as `notes/C#/pic.png` (a 0.7.0 regression,
+  confirmed against the 0.7.0 package) — stripping now applies
+  to Obsidian embeds only; diagnostics read dataless cloud files
+  on macOS (their index hash is always empty, so the hash-reuse
+  optimization never applied to them) — the walk now marks
+  dataless files and the scan skips them.
+- Two of Sonnet's numbers did not reproduce on this VM and are
+  NOT used in the CHANGELOG: bulk refresh of 1,000 changed files
+  in 10,000 notes took ~14.7 s here (a full rebuild; Sonnet
+  reported 4.4 s), and a fresh load() of the persisted index
+  took ~3.3 s (Sonnet reported 979 ms) with the index file at
+  ~46 MB (was ~29 MB before the review round). The direction of
+  both findings is confirmed; the absolute numbers depend on
+  corpus and machine.
+- Low-priority, deferred to 0.8.1: load() slowness and index
+  growth above; `rebuild_index` while another process holds the
+  lock silently does nothing; a second process starting while
+  the first is building keeps using the direct-scan fallback;
+  chunk slices can exceed the 600-char cap by the length of the
+  whitespace between the two paragraphs (usually a few chars;
+  see Notes). The 5 s stale-snippet window was already documented.
+  The single-character-noise and multi-process tests the plan
+  asked for now exist (see the 125 count above); the chunker
+  test still does not cover the wide-gap case.
+
+Performance benchmark (`test/bench-search.mjs`, deterministic
+seeded corpus, 10,000 mixed Chinese/English notes, run three
+times; vocabulary widened from 36 to ~300 words for the review
+round, so these numbers are NOT comparable with the pre-review
+run):
+
+| Metric | Result |
+| --- | --- |
+| Cold index time (full build, no persisted index) | ~13.2–14.6 s |
+| Hot query p50 / p95 / p99 / max (100 mixed queries) | 23–24 ms / 56–77 ms / 67–679 ms / 70–874 ms |
+| Incremental update (10 files changed) | ~0.67–0.75 s (walk ~0.6 s, the rest is the re-index; the disk write runs in the background) |
+| Updated term found after incremental refresh | exactly 10 hits (the 10 changed files) |
+| Memory after build (heap / RSS) | ~295–450 MB / ~750–800 MB (heap varies with GC timing) |
+| Fresh load() of the persisted index | ~3.3 s (3,262–3,456 ms over three loads); index file ~46 MB (was ~29 MB before the review round) |
+
+Notes and limits (stated plainly):
+
+- The 10k-note memory figure (~217 MB heap) is the steady-state
+  cost of holding the full inverted index in memory. It is
+  acceptable for a desktop MCP server but is the largest single
+  cost in 0.8.0; a disk-backed or paged index is a possible later
+  optimization, not done here.
+- The incremental refresh cost is dominated by the full directory
+  walk (~0.6 s for 10k files: readdir + the listing's own stat;
+  no realpath except for symlinks), not by re-indexing the
+  changed files. The disk write runs in the background and does
+  not block the search that triggered the refresh. The 5 s
+  throttle bounds how often it runs; a save always refreshes on
+  the next search.
+- Placeholder detection is limited to what the OS exposes:
+  iCloud placeholder files carry a `.icloud` filename suffix and
+  are skipped; on macOS a dataless file (`stat.blocks === 0`
+  with `size > 0`) is skipped the same way. `.cloud` and
+  `.onedrive` are NOT placeholder markers and were removed.
+  Windows Offline/Recall file attributes are NOT detected: Node
+  exposes no cross-platform API for them, so a Windows OneDrive
+  placeholder would still be read (and possibly trigger a
+  download) — a known limitation, documented in the code and in
+  the CHANGELOG, not claimed otherwise.
+- The index stores chunk offsets, not chunk text: snippets are
+  sliced from the file on disk, so a file edited between indexing
+  and searching can show a stale snippet until the next refresh
+  (at most 5 s later, or on the next search after the throttle).
+- The 600-char chunk cap has one known exception: a near-cap
+  paragraph following a wide gap can exceed the cap by the
+  length of the whitespace between the two paragraphs (the
+  overlap shrinks to 0 and the gap counts toward the slice;
+  reproduced at 639 chars for a 50-line gap and 1,589 chars
+  for a 1,000-line gap). Deferred to 0.8.1.
+- DNS rebinding guard (0.7.0, `src/net-guard.ts`): UNCHANGED in
+  0.8.0. Verified present, not re-implemented: no `fetch(` in
+  `src/` (only `http.request` / `https.request` in `net-guard.ts`),
+  `safeRequest` uses `agent: false` + a custom `lookup` with a
+  single resolution and checked-address = connected-address, the
+  0.7.0 local-server test (`DNS rebinding guard (net-guard):
+  single resolve, loopback rejected with 0 connections, allowed
+  policy downloads`) passes as part of the 110/110 suite, and the
+  CHANGELOG documents it. The 2026-11-07 decision to "fix DNS
+  rebinding this round" was already satisfied by the 0.7.0
+  follow-up (2026-11-06); there was nothing left to add in 0.8.0.

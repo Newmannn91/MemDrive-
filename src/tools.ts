@@ -32,6 +32,7 @@ import {
   SVG_EXTENSION,
   TEXT_MAX_BYTES,
   resolveResponseBudgetBytes,
+  resolveSearchMaxBytes,
 } from './config.js';
 import { MemDriveError, NotFoundError } from './errors.js';
 import {
@@ -50,8 +51,14 @@ import {
   assertInsideRealRoot,
   isInside,
   sandboxPath,
+  sandboxPathForWrite,
   toDisplayPath,
 } from './sandbox.js';
+import {
+  LocalSearchIndex,
+  type Diagnostics,
+  type SearchQuery,
+} from './search-index.js';
 import type { StorageBackend, WriteMode } from './storage.js';
 import { openFolderInViewer, openInViewer } from './viewer.js';
 
@@ -59,6 +66,7 @@ interface ToolContext {
   backend: StorageBackend;
   rootDir: string;
   rootRealDir: string;
+  searchIndex: LocalSearchIndex;
 }
 
 function textBlock(text: string): TextContent {
@@ -204,10 +212,60 @@ async function handleListDirectory(
 /* search_files                                                        */
 /* ------------------------------------------------------------------ */
 
-async function handleSearchFiles(
+export interface SearchFilesOptions {
+  fileTypes?: string[];
+  tags?: string[];
+  dateFrom?: string;
+  dateTo?: string;
+  modifiedAfter?: string;
+  modifiedBefore?: string;
+  exactPhrase?: string;
+  limit?: number;
+  offset?: number;
+  rebuildIndex?: boolean;
+  diagnosticsOnly?: boolean;
+}
+
+/** Output cap for one search_files result (bytes): the search cap, never above the response budget. */
+function searchOutputCapBytes(): number {
+  return Math.min(
+    resolveSearchMaxBytes(process.env['MEMDRIVE_SEARCH_MAX_BYTES']),
+    responseBudgetBytes(),
+  );
+}
+
+/** Format a read-only diagnostics report (0.9.0 maintenance preview; never modifies anything). */
+function formatDiagnostics(diag: Diagnostics): string {
+  const lines: string[] = ['Library diagnostics (read-only — nothing was modified):', ''];
+  lines.push(`Empty files (${diag.emptyFiles.length}):`);
+  for (const f of diag.emptyFiles) {
+    lines.push(`- ${f}`);
+  }
+  lines.push('', `Duplicate groups (${diag.duplicateGroups.length}, same content SHA-256):`);
+  for (const group of diag.duplicateGroups) {
+    lines.push(`- ${group.join(', ')}`);
+  }
+  lines.push('', `Broken image references (${diag.brokenImageRefs.length}):`);
+  for (const ref of diag.brokenImageRefs) {
+    lines.push(`- ${ref.file}: ${ref.src}`);
+  }
+  lines.push('', `Orphan attachment candidates (${diag.orphanCandidates.length}, unreferenced images older than 24h):`);
+  for (const f of diag.orphanCandidates) {
+    lines.push(`- ${f}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Exported for the protocol tests (like resolveContainingFolder):
+ * the fallback and pagination paths are only reachable through this
+ * handler, and a fresh index is the only way to force the fallback.
+ */
+export async function handleSearchFiles(
   ctx: ToolContext,
   keyword: string,
   inputPath: string | undefined,
+  opts: SearchFilesOptions,
 ): Promise<CallToolResult> {
   const absolute = await sandboxPath(ctx.rootDir, ctx.rootRealDir, inputPath ?? '');
   const rel = relOf(ctx, absolute);
@@ -221,47 +279,202 @@ async function handleSearchFiles(
       `${rel} is a file, not a directory. Search a directory path instead.`,
     );
   }
-  const hits = await ctx.backend.search(
-    keyword,
-    rel === '.' ? '' : rel,
+  const scopeRel = rel === '.' ? '' : rel;
+  const cap = searchOutputCapBytes();
+
+  // Read-only diagnostics (maintenance preview). Keyword is ignored.
+  if (opts.diagnosticsOnly === true) {
+    const diag = await ctx.searchIndex.scanDiagnostics(scopeRel);
+    return okResult(truncateUtf8(formatDiagnostics(diag), cap));
+  }
+
+  if (keyword.trim() === '') {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      'search_files needs a keyword (omit it only for diagnostics_only).',
+    );
+  }
+
+  // Explicit rebuild (e.g. after a bulk import or a cache clear).
+  if (opts.rebuildIndex === true) {
+    await ctx.searchIndex.buildAll();
+  }
+  // Kick off the background build on first use; searches fall back to
+  // a direct scan until it finishes.
+  if (ctx.searchIndex.getStatus() === 'unbuilt') {
+    void ctx.searchIndex.ensureReady();
+  }
+
+  const limit = Math.min(
+    Math.max(1, Math.floor(opts.limit ?? 20)),
     SEARCH_MAX_RESULTS,
   );
-  if (hits.length === 0) {
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+  const query: SearchQuery = {
+    keyword,
+    path: scopeRel,
+    exactPhrase: opts.exactPhrase,
+    fileTypes: opts.fileTypes,
+    tags: opts.tags,
+    dateFrom: opts.dateFrom,
+    dateTo: opts.dateTo,
+    modifiedAfter: opts.modifiedAfter,
+    modifiedBefore: opts.modifiedBefore,
+    limit,
+    offset,
+  };
+  const outcome = await ctx.searchIndex.search(query);
+  if (!outcome.ready) {
+    // Index still building: direct scan (0.7.0 behavior). The file
+    // type filter and pagination still apply; tags, dates, and the
+    // exact phrase cannot be checked by a direct scan, and the
+    // result says so instead of silently pretending they were.
+    const allHits = await ctx.backend.search(keyword, scopeRel, SEARCH_MAX_RESULTS);
+    const wantedExts = (opts.fileTypes ?? []).map((e) =>
+      e.startsWith('.') ? e.toLowerCase() : `.${e.toLowerCase()}`,
+    );
+    const hits = wantedExts.length > 0
+      ? allHits.filter((h) => wantedExts.includes(path.extname(h).toLowerCase()))
+      : allHits;
+    const ignored: string[] = [];
+    if ((opts.tags ?? []).length > 0) {
+      ignored.push('tags');
+    }
+    if (opts.dateFrom !== undefined || opts.dateTo !== undefined) {
+      ignored.push('dates');
+    }
+    if (opts.modifiedAfter !== undefined || opts.modifiedBefore !== undefined) {
+      ignored.push('modification times');
+    }
+    if (opts.exactPhrase !== undefined) {
+      ignored.push('exact_phrase');
+    }
+    if (hits.length === 0) {
+      return okResult(
+        `No files matching ${JSON.stringify(keyword)} under ${rel}. (Search index is still building; this was a direct scan.)`,
+      );
+    }
+    const needle = keyword.toLowerCase();
+    const pageHits = hits.slice(offset, offset + limit);
+    const hitLines: string[] = [];
+    for (const hit of pageHits) {
+      const name = hit.split('/').pop() ?? hit;
+      let kind = 'content';
+      let excerpt = '';
+      if (name.toLowerCase().includes(needle)) {
+        kind = 'name';
+      } else {
+        try {
+          const data = await ctx.backend.readFile(hit);
+          if (!looksBinary(data)) {
+            const text = data.toString('utf8');
+            const line = text
+              .split('\n')
+              .find((l) => l.toLowerCase().includes(needle));
+            if (line !== undefined) {
+              excerpt = ` — ${line.trim().slice(0, 160)}`;
+            }
+          }
+        } catch {
+          // Excerpt is best-effort; the hit itself stands.
+        }
+      }
+      hitLines.push(`- ${hit} (${kind})${excerpt}`);
+    }
+    const headerFor = (shown: number): string[] => {
+      const lines = [
+        `Found ${hits.length} file(s) matching ${JSON.stringify(keyword)} under ${rel} (direct scan — search index is still building; showing ${offset + 1}–${offset + shown}):`,
+        '',
+      ];
+      if (hits.length >= SEARCH_MAX_RESULTS) {
+        lines.push(`Results capped at ${SEARCH_MAX_RESULTS}; narrow the keyword or path for more.`);
+      }
+      if (ignored.length > 0) {
+        lines.push(`Note: in direct-scan mode ${ignored.join(', ')} were NOT applied — only the keyword, path, and file types were.`);
+      }
+      return lines;
+    };
+    const fitted = fitSearchOutput(
+      headerFor,
+      hitLines,
+      (shown) => `More results available: pass offset ${offset + shown} (limit ${limit}) for the next page.`,
+      hits.length,
+      offset,
+      cap,
+    );
+    return okResult(fitted.text);
+  }
+
+  if (outcome.total === 0) {
     return okResult(`No files matching ${JSON.stringify(keyword)} under ${rel}.`);
   }
-  const needle = keyword.toLowerCase();
-  const lines = [
-    `Found ${hits.length} file(s) matching ${JSON.stringify(keyword)} under ${rel}:`,
-    '',
-  ];
-  for (const hit of hits) {
-    const name = hit.split('/').pop() ?? hit;
-    let kind = 'content';
-    let excerpt = '';
-    if (name.toLowerCase().includes(needle)) {
-      kind = 'name';
-    } else {
-      try {
-        const data = await ctx.backend.readFile(hit);
-        if (!looksBinary(data)) {
-          const text = data.toString('utf8');
-          const line = text
-            .split('\n')
-            .find((l) => l.toLowerCase().includes(needle));
-          if (line !== undefined) {
-            excerpt = ` — ${line.trim().slice(0, 160)}`;
-          }
-        }
-      } catch {
-        // Excerpt is best-effort; the hit itself stands.
+  const hitLines = outcome.hits.map((hit) => {
+    const section = hit.section.length > 0 ? ` [${hit.section}]` : '';
+    return `- ${hit.path}${section} (score ${hit.score.toFixed(2)}) — ${hit.snippet}`;
+  });
+  const fitted = fitSearchOutput(
+    (shown) => [
+      `Found ${outcome.total} matching file(s) for ${JSON.stringify(keyword)} under ${rel} (showing ${offset + 1}–${offset + shown}):`,
+      '',
+    ],
+    hitLines,
+    (shown) => `More results available: pass offset ${offset + shown} (limit ${limit}) for the next page.`,
+    outcome.total,
+    offset,
+    cap,
+  );
+  return okResult(fitted.text);
+}
+
+/**
+ * Join search output within a byte budget, reserving room for the
+ * trailing "More results" line so truncation never eats it — and
+ * never eats results the next page would then skip. The header and
+ * the "More" line are recomputed from the number of hits actually
+ * shown, so the next page's offset advances by the displayed count,
+ * not the computed one. The "More" line appears whenever results
+ * remain beyond the displayed ones, including results the budget
+ * cut off. Returns the fitted text and the shown count.
+ */
+function fitSearchOutput(
+  headerFor: (shown: number) => string[],
+  hitLines: string[],
+  moreFor: (shown: number) => string,
+  total: number,
+  offset: number,
+  cap: number,
+): { text: string; shown: number } {
+  // Reserve for the longest plausible "More" line (largest offset);
+  // the final line can only be shorter, so the total stays in budget.
+  const reserve =
+    hitLines.length > 0
+      ? Buffer.byteLength(`\n\n${moreFor(hitLines.length)}`, 'utf8')
+      : 0;
+  let shown = hitLines.length;
+  for (;;) {
+    const header = headerFor(shown);
+    let text = header.join('\n');
+    let bytes = Buffer.byteLength(text, 'utf8');
+    let actual = 0;
+    for (let i = 0; i < shown; i++) {
+      const addition = `\n${hitLines[i] as string}`;
+      if (bytes + Buffer.byteLength(addition, 'utf8') + reserve > cap) {
+        break;
       }
+      text += addition;
+      bytes += Buffer.byteLength(addition, 'utf8');
+      actual += 1;
     }
-    lines.push(`- ${hit} (${kind})${excerpt}`);
+    if (actual === shown) {
+      const moreText = total > offset + actual ? `\n\n${moreFor(actual)}` : '';
+      return { text: text + moreText, shown: actual };
+    }
+    shown = actual;
+    if (shown === 0) {
+      // Even the header alone is too long: truncate it.
+      return { text: truncateUtf8(header.join('\n'), cap), shown: 0 };
+    }
   }
-  if (hits.length >= SEARCH_MAX_RESULTS) {
-    lines.push('', `Results capped at ${SEARCH_MAX_RESULTS}; narrow the keyword or path for more.`);
-  }
-  return okResult(lines.join('\n'));
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,7 +494,10 @@ async function handleSaveFile(
   mode: WriteMode,
   imageSpecs: string[] | undefined,
 ): Promise<CallToolResult> {
-  const absolute = await sandboxPath(ctx.rootDir, ctx.rootRealDir, inputPath);
+  // Writes get the cross-platform segment check (reserved names,
+  // ADS, trailing dot/space); reads do not, so files synced in
+  // under names like `meeting 10:30.md` still open.
+  const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
   const rel = relOf(ctx, absolute);
   if (rel === '.') {
     throw new MemDriveError('INVALID_PATH', 'save_file needs a file path, not the library root.');
@@ -345,7 +561,7 @@ async function handleSaveFile(
     // images with a note; the text still saves.
     let assetsOk = true;
     try {
-      await sandboxPath(ctx.rootDir, ctx.rootRealDir, assetsRel);
+      await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, assetsRel);
     } catch {
       assetsOk = false;
       notes.push(
@@ -398,6 +614,9 @@ async function handleSaveFile(
       Buffer.from(body, 'utf8'),
       mode,
     );
+    // Tell the index the file changed: the next search refreshes
+    // before answering, so a just-saved note is searchable at once.
+    ctx.searchIndex.markDirty(rel);
     const lines = [
       `Saved ${rel} (${formatBytes(Buffer.byteLength(body, 'utf8'))}, mode: ${mode}${created ? ', created' : ''}).`,
     ];
@@ -863,8 +1082,14 @@ export function registerTools(
   backend: StorageBackend,
   rootDir: string,
   rootRealDir: string,
+  searchIndex?: LocalSearchIndex,
 ): void {
-  const ctx: ToolContext = { backend, rootDir, rootRealDir };
+  const ctx: ToolContext = {
+    backend,
+    rootDir,
+    rootRealDir,
+    searchIndex: searchIndex ?? new LocalSearchIndex(rootDir, rootRealDir, backend),
+  };
 
   const wrap = (
     fn: () => Promise<CallToolResult>,
@@ -903,24 +1128,93 @@ export function registerTools(
     'search_files',
     {
       description: [
-        'Search the memory library for files by keyword: matches file names (case-insensitive substring) and, for small text files, file contents.',
-        'Searches recursively under the given directory. Returns root-relative paths with a match kind (name/content) and, for content matches, the first matching line.',
+        'Search the memory library by keyword, ranked by relevance (full-text index + BM25; Chinese queries are segmented, so 1–2 character terms match).',
+        'Returns one hit per matching file (its best-matching chunk) with the file path, section heading, relevance score, and a snippet with the matched term highlighted as **term**. Filename matches are included too: a substring of a filename finds the file, including non-text files such as images. Results are paginated: limit defaults to 20, pass offset for the next page.',
+        'Filters: file_types (e.g. [".md"]), tags (a file must carry at least one), date_from/date_to (file date: front matter > filename > modification time; a date-only upper bound covers the whole day), modified_after/modified_before (modification time). exact_phrase requires the phrase to appear verbatim.',
+        'diagnostics_only returns a read-only library report (empty files, duplicate content, broken image references, unreferenced attachments older than 24h) and never modifies anything; keyword is not needed for it. rebuild_index forces a full index rebuild first (use after a bulk import or a cache clear).',
+        'On the first search after startup the index may still be building in the background; the result then says so and falls back to a direct scan (keyword, path, and file types only — tags, dates, and exact_phrase are not applied there, and the result says so).',
         'Paths are relative to the library root (MEMDRIVE_ROOT). Omit path or pass "" to search the whole library.',
       ].join('\n'),
       inputSchema: {
         keyword: z
           .string()
-          .min(1)
-          .describe('Keyword to search for (case-insensitive substring).'),
+          .optional()
+          .describe('Keyword to search for (case-insensitive; Chinese terms are segmented). Required unless diagnostics_only is true.'),
         path: z
           .string()
           .optional()
           .describe(
             'Directory to search under, relative to the library root. Omit or pass "" for the whole library.',
           ),
+        file_types: z
+          .array(z.string())
+          .optional()
+          .describe('File extensions to include, e.g. [".md", ".txt"]. Omit for all types.'),
+        tags: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'A file must carry at least one of these tags (YAML front matter `tags:` or body `#tag`). Omit for all.',
+          ),
+        date_from: z
+          .string()
+          .optional()
+          .describe('Earliest file date (ISO date, e.g. "2026-01-01"). File date is front matter date, then filename date, then modification time.'),
+        date_to: z
+          .string()
+          .optional()
+          .describe('Latest file date (ISO date, e.g. "2026-12-31").'),
+        modified_after: z
+          .string()
+          .optional()
+          .describe('Earliest modification time (ISO date).'),
+        modified_before: z
+          .string()
+          .optional()
+          .describe('Latest modification time (ISO date).'),
+        exact_phrase: z
+          .string()
+          .optional()
+          .describe('Phrase that must appear verbatim in a matching chunk (in addition to the keyword).'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(SEARCH_MAX_RESULTS)
+          .optional()
+          .describe('Maximum files to return (default 20, max 200).'),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('Files to skip for pagination (default 0).'),
+        rebuild_index: z
+          .boolean()
+          .optional()
+          .describe('Force a full index rebuild before searching (default false).'),
+        diagnostics_only: z
+          .boolean()
+          .optional()
+          .describe('Return the read-only library diagnostics report instead of searching (default false).'),
       },
     },
-    (args) => wrap(() => handleSearchFiles(ctx, args.keyword, args.path)),
+    (args) =>
+      wrap(() =>
+        handleSearchFiles(ctx, args.keyword ?? '', args.path, {
+          fileTypes: args.file_types,
+          tags: args.tags,
+          dateFrom: args.date_from,
+          dateTo: args.date_to,
+          modifiedAfter: args.modified_after,
+          modifiedBefore: args.modified_before,
+          exactPhrase: args.exact_phrase,
+          limit: args.limit,
+          offset: args.offset,
+          rebuildIndex: args.rebuild_index,
+          diagnosticsOnly: args.diagnostics_only,
+        }),
+      ),
   );
 
   server.registerTool(

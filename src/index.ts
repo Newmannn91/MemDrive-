@@ -14,11 +14,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { resolveRootDir } from './config.js';
+import { LocalSearchIndex } from './search-index.js';
 import { LocalStorageBackend } from './storage.js';
 import { registerTools } from './tools.js';
 import { runSetupWizard } from './wizard.js';
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 
 async function main(): Promise<void> {
   // `node dist/index.js setup` runs the interactive setup wizard
@@ -43,7 +44,19 @@ async function main(): Promise<void> {
     name: 'memdrive-mcp',
     version: VERSION,
   });
-  registerTools(server, backend, rootRealDir, rootRealDir);
+  // Search index: load a persisted copy when one exists, then build
+  // in the background (never block server startup). Searches fall
+  // back to a direct scan until the index is ready.
+  const searchIndex = new LocalSearchIndex(rootRealDir, rootRealDir, backend);
+  void searchIndex
+    .load()
+    .then(() => searchIndex.ensureReady())
+    .catch((error: unknown) => {
+      console.error(
+        `[memdrive] search index build failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  registerTools(server, backend, rootRealDir, rootRealDir, searchIndex);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

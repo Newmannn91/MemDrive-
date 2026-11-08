@@ -28,6 +28,8 @@ export interface DirEntry {
   type: 'file' | 'directory';
   size: number;
   modifiedAt: string;
+  /** True when the entry itself is a symlink (stat follows it, so type/size describe the target). */
+  isSymlink: boolean;
 }
 
 export type WriteMode = 'new' | 'overwrite' | 'append';
@@ -42,7 +44,13 @@ export interface StorageBackend {
   /** Metadata for a path, or null when it does not exist. */
   stat(
     relPath: string,
-  ): Promise<{ size: number; isDirectory: boolean; modifiedAt: string } | null>;
+  ): Promise<{
+    size: number;
+    isDirectory: boolean;
+    modifiedAt: string;
+    /** Allocated 512-byte blocks (fs.stat); 0 for a dataless cloud placeholder on macOS. */
+    blocks?: number;
+  } | null>;
 
   /** True when the path exists (file or directory). */
   exists(relPath: string): Promise<boolean>;
@@ -107,6 +115,7 @@ export class LocalStorageBackend implements StorageBackend {
         type: isDir ? 'directory' : 'file',
         size: isDir ? 0 : st.size,
         modifiedAt: st.mtime.toISOString(),
+        isSymlink: dirent.isSymbolicLink(),
       });
     }
     entries.sort((a, b) => {
@@ -124,13 +133,19 @@ export class LocalStorageBackend implements StorageBackend {
 
   public async stat(
     relPath: string,
-  ): Promise<{ size: number; isDirectory: boolean; modifiedAt: string } | null> {
+  ): Promise<{
+    size: number;
+    isDirectory: boolean;
+    modifiedAt: string;
+    blocks?: number;
+  } | null> {
     try {
       const st = await fs.stat(this.absolute(relPath));
       return {
         size: st.size,
         isDirectory: st.isDirectory(),
         modifiedAt: st.mtime.toISOString(),
+        blocks: st.blocks,
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {

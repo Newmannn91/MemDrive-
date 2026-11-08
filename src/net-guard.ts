@@ -328,7 +328,7 @@ export function safeRequest(
         ...(lookup !== undefined ? { lookup } : {}),
         ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
         headers: {
-          'User-Agent': 'memdrive-mcp/0.7.0',
+          'User-Agent': 'memdrive-mcp/0.8.0',
           Accept: 'image/*',
           ...opts.headers,
         },
