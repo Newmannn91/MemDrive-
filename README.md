@@ -9,7 +9,7 @@ through six small tools. No cloud service, no account, no server to run —
 the MCP server runs on your own machine and touches only the folder you
 point it at.
 
-> **Status: 0.8.0.** Local filesystem backend only. Full-text search index with BM25 ranking (Chinese segmentation, filters, pagination, read-only diagnostics).
+> **Status: 0.8.1.** Local filesystem backend only. Full-text search index with BM25 ranking (Chinese segmentation, filters, pagination, read-only diagnostics).
 > 0.1.1 added one total response budget to `read_file` (see
 > [Reading back](#reading-back-packed-two-step-and-single-image) and
 > [Limits](#limits-all-in-srcconfigts-nowhere-else)) and put the
@@ -364,6 +364,18 @@ hosts are added only on user feedback after these four.
 | `read_file(path, include_images?)` | Reads text, or a Markdown file **together with its referenced images** in one response, within one total response budget. Pass `include_images: false` for text only plus the image-path list (step 1 of two-step reading). |
 | `open_image(path)` | Opens an image file in the OS default image viewer, at full original quality. Only when the user explicitly asks to view the original — never automatically, and never returns image bytes to the model. |
 | `open_containing_folder(path?)` | Opens the folder containing a file (or the folder itself) in the OS file manager, without highlighting or selecting any file. Only when the user explicitly asks to open the folder — never automatically, and never returns folder contents to the model. Omit the path to open the library root. |
+
+### Searching: keyword vs exact phrase
+
+A keyword search splits Chinese queries into single characters and
+ranks every note that shares them, so a note that only shares a few
+characters can still show up as a weak match. That is by design: it
+finds things even when you remember only part of a phrase.
+
+When the results are noisy, or you want to confirm a phrase is really
+in a note, ask for an exact-phrase search instead: only notes
+containing the phrase verbatim are returned. Say "用精确短语搜
+「第一段哨兵词」" and the model passes `exact_phrase`.
 
 ### Reading back: packed, two-step, and single-image
 

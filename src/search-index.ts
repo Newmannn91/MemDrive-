@@ -258,9 +258,22 @@ function isValidIndex(parsed: unknown): parsed is SerializedIndex {
   if (typeof p['updatedAt'] !== 'string' || !Array.isArray(p['fileNames'])) {
     return false;
   }
+  // Every file name must be a string: search calls path.basename
+  // on each one, which throws on a non-string.
+  if (!(p['fileNames'] as unknown[]).every((n) => typeof n === 'string')) {
+    return false;
+  }
   if (!isRecord(p['files']) || !isRecord(p['postings'])) {
     return false;
   }
+  // Cross-checks (0.8.1): the writer guarantees all of these, so a
+  // file that fails one is damaged. Without them a corrupt index
+  // loads fine and search silently skips the broken parts — a
+  // missed hit with no error, and refresh never repairs it (it only
+  // updates changed files). Rejecting the file just triggers a
+  // rebuild, which is always safe.
+  const fileKeys = new Set(Object.keys(p['files'] as Record<string, unknown>));
+  const chunkIds = new Set<number>();
   for (const chunk of p['chunks'] as Array<Record<string, unknown>>) {
     if (
       typeof chunk !== 'object' ||
@@ -272,6 +285,15 @@ function isValidIndex(parsed: unknown): parsed is SerializedIndex {
       typeof chunk['section'] !== 'string' ||
       typeof chunk['tokenCount'] !== 'number'
     ) {
+      return false;
+    }
+    // Two chunks must not share an id (hits would be attributed to
+    // the wrong file), and every chunk must belong to a file entry.
+    if (chunkIds.has(chunk['id'])) {
+      return false;
+    }
+    chunkIds.add(chunk['id']);
+    if (!fileKeys.has(chunk['file'])) {
       return false;
     }
   }
@@ -294,6 +316,13 @@ function isValidIndex(parsed: unknown): parsed is SerializedIndex {
     ) {
       return false;
     }
+    // Every chunk a file claims must exist, or its content is
+    // silently unsearchable.
+    for (const id of e['chunkIds'] as number[]) {
+      if (!chunkIds.has(id)) {
+        return false;
+      }
+    }
   }
   for (const perChunk of Object.values(p['postings'] as Record<string, unknown>)) {
     if (!isRecord(perChunk)) {
@@ -301,6 +330,13 @@ function isValidIndex(parsed: unknown): parsed is SerializedIndex {
     }
     for (const tf of Object.values(perChunk)) {
       if (typeof tf !== 'number') {
+        return false;
+      }
+    }
+    // Every posting must point at a real chunk (search skips a
+    // dangling one with no error).
+    for (const idStr of Object.keys(perChunk)) {
+      if (!chunkIds.has(Number(idStr))) {
         return false;
       }
     }
@@ -318,6 +354,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * exact-phrase search, and relevance ranking. `LocalSearchIndex`
  * is the implementation; callers only depend on this interface.
  */
+/**
+ * What a full rebuild (`buildAll`) did: `'built'` (fresh index
+ * written), `'locked'` (another process holds the lock — the old
+ * index stays in place), or `'failed'` (the rebuild itself threw,
+ * e.g. the cache directory is not writable). Callers must not
+ * collapse `'locked'` and `'failed'`: the user-facing text differs
+ * (F1).
+ */
+export type BuildResult = 'built' | 'locked' | 'failed';
+
 export interface SearchIndex {
   getStatus(): IndexStatus;
   getCacheDir(): string;
@@ -327,7 +373,7 @@ export interface SearchIndex {
   markDirty(relPath: string): void;
   search(query: SearchQuery): Promise<SearchOutcome>;
   scanDiagnostics(scope?: string): Promise<Diagnostics>;
-  buildAll(): Promise<boolean>;
+  buildAll(): Promise<BuildResult>;
   persist(): Promise<void>;
 }
 
@@ -383,13 +429,16 @@ export function chunkText(text: string): Array<Omit<IndexChunk, 'id' | 'file' | 
       }
       flush(last.end);
       // Next chunk re-opens with an overlap tail (up to 100 chars),
-      // shrunk when the new unit is long — or the gap to it is wide —
-      // so the emitted slice never exceeds the chunk cap, except when
-      // the gap before a near-cap unit forces zero overlap.
+      // shrunk when the new unit is long — or the gap to it is wide.
+      // When the gap forces zero overlap, the next chunk starts at
+      // the unit's start instead: the blank gap carries no searchable
+      // text, so skipping it loses nothing — and the emitted slice
+      // never exceeds the chunk cap.
       const gap = unit.start - last.end;
       const maxOverlap = Math.max(0, SEARCH_CHUNK_MAX_CHARS - unitLen - gap);
       const overlap = Math.min(SEARCH_CHUNK_OVERLAP_CHARS, maxOverlap);
-      const nextStart = Math.max(currentStart, last.end - overlap);
+      const nextStart =
+        overlap === 0 ? unit.start : Math.max(currentStart, last.end - overlap);
       currentStart = nextStart;
       currentSection = unit.section;
       current = [unit];
@@ -708,6 +757,16 @@ export class LocalSearchIndex implements SearchIndex {
   private lastRefreshMs = 0;
   /** True after a save until the next refresh has run: the next search waits for it. */
   private needsRefresh = false;
+  /**
+   * True when a search threw on the in-memory index: the on-disk
+   * copy it was loaded from is the same damaged data, so
+   * `ensureReady()` must NOT load it again (it would only re-arm
+   * the same failure) — it rebuilds straight away. Cleared when a
+   * rebuild succeeds. Without this, the 0.8.1 load-first
+   * `ensureReady()` broke the auto-heal: a corrupt-but-validating
+   * index was reloaded on every search and never rebuilt.
+   */
+  private distrustDisk = false;
   /** Next chunk id to hand out; only grows, never reused after a removal. */
   private nextChunkIdValue = 0;
   /**
@@ -750,27 +809,41 @@ export class LocalSearchIndex implements SearchIndex {
    * follows). A file that parses but has the wrong shape — e.g.
    * `{"version":2,"chunks":[]}` with no `files`/`postings` — used
    * to load as `ready` and then throw on every search, forever.
+   *
+   * `load()` never downgrades the status (F2): on any failure it
+   * leaves the status exactly as it was. Callers only invoke it
+   * while `unbuilt`, so in practice a failure leaves it `unbuilt`;
+   * but a concurrent build in this same process must keep its
+   * `building` status, and a `ready` index must keep its data.
    */
   public async load(): Promise<void> {
+    // Another process is mid-build (holds a fresh lock): do not load
+    // the index it is about to replace — a later persist could write
+    // our stale copy over the builder's fresh one. Stay unbuilt;
+    // ensureReady() retries the load once the lock clears.
+    if (await this.isLockHeldByLiveProcess()) {
+      return;
+    }
     try {
       const raw = await fs.readFile(this.indexPath, 'utf8');
       const parsed = JSON.parse(raw) as SerializedIndex;
       if (!isValidIndex(parsed)) {
-        this.status = 'unbuilt';
         return;
       }
-      // Null-prototype maps, so keys like `__proto__` stay ordinary
-      // own properties (see nullRecord). `JSON.parse` already made
-      // them own properties; the prototype swap only guards later
+      // Null-prototype top-level maps, so keys like `__proto__` stay
+      // ordinary own properties (see nullRecord). `JSON.parse` already
+      // made them own properties; the swap only guards later
       // assignments such as `files[relPath] = entry`.
-      const files = nullRecord<IndexedFile>();
-      for (const [relPath, entry] of Object.entries(parsed.files)) {
-        files[relPath] = entry;
-      }
-      const postings = nullRecord<Record<string, number>>();
-      for (const [term, perChunk] of Object.entries(parsed.postings)) {
-        postings[term] = Object.assign(nullRecord<number>(), perChunk);
-      }
+      // The per-chunk maps stay as parsed: their keys are chunk-id
+      // numbers only, so they can never be `__proto__` — and copying
+      // each one into a fresh null-prototype object cost ~500 ms on
+      // a 10k-note library (0.8.1 E, measured). One Object.assign
+      // per top-level map does the same job in ~17 ms.
+      const files = Object.assign(nullRecord<IndexedFile>(), parsed.files);
+      const postings = Object.assign(
+        nullRecord<Record<string, number>>(),
+        parsed.postings,
+      );
       this.data = { ...parsed, files, postings };
       let maxId = -1;
       for (const chunk of this.data.chunks) {
@@ -782,7 +855,7 @@ export class LocalSearchIndex implements SearchIndex {
       this.rebuildPostingsCount();
       this.status = 'ready';
     } catch {
-      this.status = 'unbuilt';
+      // Leave the status untouched (F2, see the doc comment above).
     }
   }
 
@@ -794,11 +867,31 @@ export class LocalSearchIndex implements SearchIndex {
     if (this.buildPromise !== null) {
       return this.buildPromise;
     }
-    this.buildPromise = this.buildAll()
-      .then(() => undefined)
-      .finally(() => {
-        this.buildPromise = null;
-      });
+    this.buildPromise = (async () => {
+      // A previous attempt — or another process — may have left a
+      // fresh index on disk: load it instead of rebuilding from
+      // scratch. But not when the on-disk index is distrusted: a
+      // search just threw on it, so loading it again would only
+      // re-arm the same failure and the auto-heal would never run.
+      if (!this.distrustDisk) {
+        await this.load();
+      }
+      if (this.status === 'ready') {
+        return;
+      }
+      const result = await this.buildAll();
+      if (result !== 'built' && this.getStatus() !== 'ready') {
+        // The lock was held by another process: it may have finished
+        // since our build attempt — pick up its index instead of
+        // staying on the direct-scan fallback. (Skipped when the
+        // disk index is distrusted, for the same reason as above.)
+        if (!this.distrustDisk) {
+          await this.load();
+        }
+      }
+    })().finally(() => {
+      this.buildPromise = null;
+    });
     return this.buildPromise;
   }
 
@@ -1082,15 +1175,22 @@ export class LocalSearchIndex implements SearchIndex {
    * Rebuild the whole index from disk (background; yields the event
    * loop between files). Holds the single-writer lock for the whole
    * build, so a concurrent rebuild in another process cannot
-   * interleave and silently overwrite it. Returns false when the
-   * lock could not be taken (the old index stays in place).
+   * interleave and silently overwrite it. Returns `'locked'` when
+   * the lock could not be taken (the old index stays in place) and
+   * `'failed'` when the rebuild itself threw; a failure is logged —
+   * a silent `'failed'` would leave the user with no way to tell
+   * it apart from a lock.
    */
-  public async buildAll(): Promise<boolean> {
+  public async buildAll(): Promise<BuildResult> {
     const locked = await this.acquireLock();
     if (!locked) {
-      return false;
+      return 'locked';
     }
     this.status = 'building';
+    // True once the new index has been swapped in: a later failure
+    // is a write failure, and the swapped-in index is complete and
+    // usable even for an empty library (totalChunks 0).
+    let swappedIn = false;
     try {
       const { files, allNames } = await this.walkTextFiles();
       const next: SerializedIndex = {
@@ -1122,16 +1222,26 @@ export class LocalSearchIndex implements SearchIndex {
       }
       next.avgChunkLen = next.totalChunks > 0 ? totalTokens / next.totalChunks : 0;
       this.data = next;
+      swappedIn = true;
       this.rebuildPostingsCount();
       this.nextChunkIdValue = nextChunkId;
       this.status = 'ready';
       await this.writeIndexFile();
-      return true;
-    } catch {
+      // A fresh index is on disk now: the distrusted copy is gone.
+      this.distrustDisk = false;
+      return 'built';
+    } catch (error) {
       // A failed build leaves the previous index (if any) in place;
-      // searches keep falling back to a direct scan.
-      this.status = this.data.totalChunks > 0 ? 'ready' : 'unbuilt';
-      return false;
+      // searches keep falling back to a direct scan. If the new
+      // index was already swapped in, it is complete and usable —
+      // only the write failed — so the status stays 'ready' even
+      // for an empty library (totalChunks 0).
+      this.status =
+        swappedIn || this.data.totalChunks > 0 ? 'ready' : 'unbuilt';
+      console.error(
+        `[memdrive] search index rebuild failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return 'failed';
     } finally {
       await this.releaseLock();
     }
@@ -1228,10 +1338,11 @@ export class LocalSearchIndex implements SearchIndex {
     // file by file (each removal used to scan the whole index).
     const totalFiles = Object.keys(this.data.files).length;
     if (changed.length + deleted.length > Math.max(200, Math.floor(totalFiles * 0.05))) {
-      if (await this.buildAll()) {
+      if ((await this.buildAll()) === 'built') {
         return;
       }
-      // The lock was busy: fall through to incremental updates.
+      // The lock was busy or the rebuild failed: fall through to
+      // incremental updates.
     }
     const anyChange = changed.length > 0 || deleted.length > 0;
     // Pass 2: apply the changes, yielding between files. All
@@ -1401,6 +1512,26 @@ export class LocalSearchIndex implements SearchIndex {
     await atomicWrite(this.indexPath, JSON.stringify(this.data), {});
   }
 
+  /**
+   * True when another process is currently building (holds a fresh
+   * lock). A stale lock — older than the timeout, e.g. left by a
+   * crashed process — does not count: the builder is gone, so the
+   * on-disk index is safe to load and the lock is stealable.
+   */
+  private async isLockHeldByLiveProcess(): Promise<boolean> {
+    try {
+      const raw = await fs.readFile(this.lockPath, 'utf8');
+      const prev = JSON.parse(raw) as { time?: number };
+      return (
+        typeof prev.time === 'number' &&
+        Date.now() - prev.time <= INDEX_LOCK_TIMEOUT_MS
+      );
+    } catch {
+      // No lock file, or unreadable: treat as not held.
+      return false;
+    }
+  }
+
   /** Try to take the lock file ('wx'); steal it when older than the timeout. */
   private async acquireLock(): Promise<boolean> {
     // The cache directory must exist before the lock file can be
@@ -1473,8 +1604,11 @@ export class LocalSearchIndex implements SearchIndex {
       return await this.searchInner(query, dateFrom, dateTo, modAfter, modBefore);
     } catch {
       // A damaged in-memory index must never fail every search
-      // forever: drop back to unbuilt so callers fall back to a
+      // forever: mark the on-disk copy distrusted (it is the same
+      // damaged data — loading it again would only re-arm the same
+      // failure), drop back to unbuilt so callers fall back to a
       // direct scan, and rebuild in the background.
+      this.distrustDisk = true;
       this.status = 'unbuilt';
       void this.ensureReady().catch(() => undefined);
       return { ready: false, hits: [], total: 0 };

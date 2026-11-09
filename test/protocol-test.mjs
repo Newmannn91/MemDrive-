@@ -9,12 +9,13 @@
  * Exit code 0 = every check passed.
  */
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -2074,6 +2075,27 @@ async function main() {
       }
     });
 
+    await check('0.8.1 chunker: wide gap + near-cap paragraph no longer exceeds the 600 cap', async () => {
+      // The 0.8.0 gap case: a near-cap paragraph after a wide blank
+      // gap used to emit a 639-char chunk (50 blank lines) or a
+      // 1,589-char chunk (1,000 blank lines) — the gap counted toward
+      // the slice because the next chunk re-opened at the previous
+      // paragraph's end. Now the next chunk starts at the paragraph.
+      for (const gapLines of [50, 1000]) {
+        const para = '测'.repeat(590);
+        const text = `${para}\n${'\n'.repeat(gapLines)}${para}\n`;
+        const chunks = chunkText(text);
+        assert.ok(chunks.length >= 2);
+        for (const c of chunks) {
+          assert.ok(c.endOffset - c.startOffset <= 600, `chunk over cap: ${c.endOffset - c.startOffset}`);
+          assert.equal(text.slice(c.startOffset, c.endOffset).length, c.endOffset - c.startOffset);
+        }
+        // The second chunk starts at the second paragraph, not at the
+        // end of the first one: the blank gap is skipped, not searched.
+        assert.equal(chunks[1].startOffset, text.indexOf(para, para.length));
+      }
+    });
+
     await check('0.8.0 tags/date extraction: front matter > filename > mtime', async () => {
       assert.deepEqual(
         extractTags('---\ntags: [工作, 读书]\n---\n正文 #生活 #工作\n').sort(),
@@ -2535,7 +2557,10 @@ async function main() {
       await fs.mkdir(outsideDir, { recursive: true });
       await fs.writeFile(path.join(outsideDir, 'private-photo.png'), smallPng);
       await fs.utimes(path.join(outsideDir, 'private-photo.png'), old, old);
-      await fs.symlink(outsideDir, path.join(libDir, 'link'));
+      // 'junction' (not the default 'file'): creating a file symlink
+      // needs admin/Developer Mode on Windows (EPERM here), while a
+      // junction needs no privilege. The type is ignored on POSIX.
+      await fs.symlink(outsideDir, path.join(libDir, 'link'), 'junction');
       await idx.buildAll();
       const diag = await idx.scanDiagnostics();
       // The Obsidian embed resolves vault-wide: not broken, not orphan.
@@ -2616,12 +2641,436 @@ async function main() {
       const idx1 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
       const idx2 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
       const [r1, r2] = await Promise.all([idx1.buildAll(), idx2.buildAll()]);
-      assert.ok(r1 || r2, 'at least one build wins the lock');
+      assert.ok(r1 === 'built' || r2 === 'built', 'at least one build wins the lock');
       // The persisted index loads cleanly afterwards.
       const idx3 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
       await idx3.load();
       assert.equal(idx3.getStatus(), 'ready');
       assert.ok((await idx3.search({ keyword: '全文检索' })).hits.some((h) => h.path === 'a.md'));
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    /* 0.8.1 multi-process lock: the child driver below is shared by
+       the two dual-process checks. It runs in its own process, so a
+       lock it holds is a genuinely foreign lock. */
+    const dualChild = path.join(scratch, 'dual-process-child.mjs');
+    // ESM import specifiers must be file:// URLs: a bare Windows path
+    // (D:/...) is parsed as a URL with protocol 'd:' and the loader
+    // rejects it (ERR_UNSUPPORTED_ESM_URL_SCHEME). pathToFileURL works
+    // on every platform, including POSIX paths.
+    const distUrl = (p) => pathToFileURL(path.join(PROJECT, 'dist', p)).href;
+    await fs.writeFile(
+      dualChild,
+      [
+        "import fs from 'node:fs/promises';",
+        "import path from 'node:path';",
+        `import { LocalSearchIndex } from '${distUrl('search-index.js')}';`,
+        `import { LocalStorageBackend } from '${distUrl('storage.js')}';`,
+        'const [libDir, cacheDir, mode] = process.argv.slice(2);',
+        "process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;",
+        'const idx = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));',
+        "if (mode === 'build-and-hold') {",
+        '  await idx.buildAll();',
+        "  const lockPath = path.join(idx.getCacheDir(), 'index.lock');",
+        "  await fs.mkdir(cacheDir, { recursive: true });",
+        "  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, time: Date.now() }), { flag: 'wx' });",
+        "  console.log('LOCKED');",
+        '  await new Promise((r) => setTimeout(r, 3000));',
+        '  await fs.unlink(lockPath).catch(() => {});',
+        "  console.log('RELEASED');",
+        "} else if (mode === 'build') {",
+        '  const ok = await idx.buildAll();',
+        "  console.log('BUILT ' + ok);",
+        '}',
+        '',
+      ].join('\n'),
+    );
+    const runDualChild = (libDir, cacheDir, mode, timeoutMs = 60000) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [dualChild, libDir, cacheDir, mode], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let out = '';
+        child.stdout.on('data', (d) => {
+          out += d;
+        });
+        child.stderr.on('data', (d) => {
+          out += d;
+        });
+        const timer = setTimeout(() => {
+          child.kill();
+          reject(new Error(`child timed out; output so far: ${out}`));
+        }, timeoutMs);
+        child.on('exit', (code) => {
+          clearTimeout(timer);
+          if (code === 0) {
+            resolve(out);
+          } else {
+            reject(new Error(`child exited ${code}; output: ${out}`));
+          }
+        });
+        child.on('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+    await check('0.8.1 index (multi-process): second process skips load while the first builds, picks up its index after', async () => {
+      const libDir = path.join(scratch, 'index-dual-lib');
+      const cacheDir = path.join(scratch, 'index-dual-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      await fs.writeFile(path.join(libDir, 'a.md'), '# A\n\n全文检索测试。\n');
+      // First process: build the index, then hold a fresh lock for a
+      // few seconds (as a builder mid-rebuild would).
+      let childOut = '';
+      const child = spawn(process.execPath, [dualChild, libDir, cacheDir, 'build-and-hold'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child.stdout.on('data', (d) => {
+        childOut += d;
+      });
+      child.stderr.on('data', (d) => {
+        childOut += d;
+      });
+      const waitFor = async (needle, ms) => {
+        const start = Date.now();
+        while (!childOut.includes(needle)) {
+          if (Date.now() - start > ms) {
+            throw new Error(`timed out waiting for ${needle}; output so far: ${childOut}`);
+          }
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      };
+      await waitFor('LOCKED', 15000);
+      // While the first process holds the lock, the second process
+      // must NOT load its index (it is about to be replaced) and
+      // must NOT build (the lock is taken) — not even via ensureReady.
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx2 = new LocalSearchIndex(libDir, libDir, backend);
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'unbuilt');
+      assert.equal(await idx2.buildAll(), 'locked');
+      await idx2.ensureReady();
+      assert.equal(idx2.getStatus(), 'unbuilt');
+      // The first process releases the lock; the second picks up the
+      // finished index — no rebuild needed.
+      await waitFor('RELEASED', 15000);
+      await new Promise((resolve, reject) => {
+        // The child may already have exited between the RELEASED line
+        // and this listener: 'exit' never fires twice, so check first.
+        if (child.exitCode !== null) {
+          if (child.exitCode === 0) {
+            resolve();
+          } else {
+            reject(new Error(`child exited ${child.exitCode}; output: ${childOut}`));
+          }
+          return;
+        }
+        const timer = setTimeout(() => reject(new Error(`child did not exit; output: ${childOut}`)), 10000);
+        child.on('exit', (code) => {
+          clearTimeout(timer);
+          code === 0 ? resolve() : reject(new Error(`child exited ${code}; output: ${childOut}`));
+        });
+      });
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'ready');
+      assert.ok((await idx2.search({ keyword: '全文检索' })).hits.some((h) => h.path === 'a.md'));
+      // A fresh instance's ensureReady loads the finished index
+      // instead of rebuilding it: the index file is untouched.
+      const indexPath = path.join(idx2.getCacheDir(), 'index.json');
+      const before = (await fs.stat(indexPath)).mtimeMs;
+      const idx3 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      await idx3.ensureReady();
+      assert.equal(idx3.getStatus(), 'ready');
+      assert.equal((await fs.stat(indexPath)).mtimeMs, before, 'ensureReady loaded the index, it did not rebuild it');
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 index (multi-process): two processes building at once do not corrupt the shared index', async () => {
+      const libDir = path.join(scratch, 'index-dual-race-lib');
+      const cacheDir = path.join(scratch, 'index-dual-race-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      for (let i = 0; i < 200; i++) {
+        await fs.writeFile(path.join(libDir, `note-${i}.md`), `# Note ${i}\n\n全文检索测试内容 ${i}。\n`);
+      }
+      const [o1, o2] = await Promise.all([
+        runDualChild(libDir, cacheDir, 'build'),
+        runDualChild(libDir, cacheDir, 'build'),
+      ]);
+      assert.ok(o1.includes('BUILT built') || o2.includes('BUILT built'), 'at least one build wins the lock');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const idx3 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      await idx3.load();
+      assert.equal(idx3.getStatus(), 'ready');
+      assert.ok((await idx3.search({ keyword: '全文检索' })).hits.length > 0);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 index (lock): stale lock is stolen, fresh lock blocks the build', async () => {
+      const libDir = path.join(scratch, 'index-lock-lib');
+      const cacheDir = path.join(scratch, 'index-lock-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      await fs.writeFile(path.join(libDir, 'a.md'), '# A\n\n全文检索测试。\n');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      // The real cache dir is the override base plus a hash subdir
+      // (see resolveIndexCacheDir); the lock lives there.
+      const lockPath = path.join(idx.getCacheDir(), 'index.lock');
+      // A lock older than the 30 s timeout (crashed process): the
+      // build steals it and proceeds.
+      await fs.mkdir(idx.getCacheDir(), { recursive: true });
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ pid: 999999, time: Date.now() - 60_000 }),
+      );
+      assert.equal(await idx.buildAll(), 'built');
+      assert.equal(idx.getStatus(), 'ready');
+      // A fresh lock (live builder): the build refuses, and load()
+      // does not read the index the builder is about to replace.
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ pid: 999999, time: Date.now() }),
+      );
+      const idx2 = new LocalSearchIndex(libDir, libDir, backend);
+      assert.equal(await idx2.buildAll(), 'locked');
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'unbuilt');
+      // Lock gone: load picks up the finished index.
+      await fs.unlink(lockPath);
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'ready');
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 search_files (handler): rebuild_index while another process holds the lock says so', async () => {
+      const libDir = path.join(scratch, 'index-rebuild-note-lib');
+      const cacheDir = path.join(scratch, 'index-rebuild-note-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'a.md'), '全文检索 in markdown.\n');
+      await idx.buildAll();
+      assert.equal(idx.getStatus(), 'ready');
+      // Another process is mid-build: hold a fresh lock.
+      const lockPath = path.join(idx.getCacheDir(), 'index.lock');
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ pid: 999999, time: Date.now() }),
+      );
+      const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
+      const res = await handleSearchFiles(ctx, '全文检索', '', { rebuildIndex: true, limit: 20 });
+      const text = textOf(res);
+      assert.match(text, /rebuild skipped/);
+      // The search itself still ran on the existing index.
+      assert.match(text, /a\.md/);
+      await fs.unlink(lockPath);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 buildAll (F1): a failed rebuild reports failed, and the handler says so', async () => {
+      const libDir = path.join(scratch, 'index-build-failed-lib');
+      const cacheDir = path.join(scratch, 'index-build-failed-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'a.md'), '全文检索 in markdown.\n');
+      // Block the write: make index.json a directory, so the atomic
+      // rename at the end of the build fails.
+      const indexPath = path.join(idx.getCacheDir(), 'index.json');
+      await fs.mkdir(indexPath, { recursive: true });
+      assert.equal(await idx.buildAll(), 'failed');
+      // The write failed but the in-memory index is complete, so the
+      // status is 'ready' (only persistence failed, not the build).
+      assert.equal(idx.getStatus(), 'ready');
+      // The handler distinguishes it from a lock: the note says the
+      // rebuild failed, not that another process is building — and
+      // the search still runs (direct-scan fallback).
+      const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
+      const res = await handleSearchFiles(ctx, '全文检索', '', { rebuildIndex: true, limit: 20 });
+      const text = textOf(res);
+      assert.match(text, /rebuild failed/);
+      assert.doesNotMatch(text, /another MemDrive process/);
+      assert.match(text, /a\.md/);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 load (F2): load() while a build runs does not clobber the building status', async () => {
+      const libDir = path.join(scratch, 'index-load-building-lib');
+      const cacheDir = path.join(scratch, 'index-load-building-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      for (let i = 0; i < 300; i++) {
+        await fs.writeFile(path.join(libDir, `note-${i}.md`), `# Note ${i}\n\n全文检索测试内容 ${i}。\n`);
+      }
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      // Start a build without awaiting it; wait until it is actually
+      // building (it holds the lock from here on).
+      const building = idx.buildAll();
+      const start = Date.now();
+      while (idx.getStatus() !== 'building') {
+        if (Date.now() - start > 10000) {
+          throw new Error('build never reached building status');
+        }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      // load() now: the lock is held, so it skips — but it must NOT
+      // overwrite 'building' with 'unbuilt' (the old code did).
+      await idx.load();
+      assert.equal(idx.getStatus(), 'building');
+      assert.equal(await building, 'built');
+      assert.equal(idx.getStatus(), 'ready');
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 load (validation): a corrupt index file is rejected and rebuilt', async () => {
+      const libDir = path.join(scratch, 'index-validation-lib');
+      const cacheDir = path.join(scratch, 'index-validation-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'a.md'), '# A\n\n全文检索测试内容。\n');
+      await fs.writeFile(path.join(libDir, 'b.md'), '# B\n\n另一篇笔记。\n');
+      await idx.buildAll();
+      assert.equal(idx.getStatus(), 'ready');
+      // Corrupt the persisted index the way a torn write could: the
+      // structure still looks valid, but a file name is not a
+      // string. The cross-checks reject it at load time instead of
+      // letting search silently skip the broken parts.
+      const indexPath = path.join(idx.getCacheDir(), 'index.json');
+      const raw = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+      raw.fileNames = [123];
+      await fs.writeFile(indexPath, JSON.stringify(raw));
+      const idx2 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'unbuilt');
+      await idx2.ensureReady();
+      assert.equal(idx2.getStatus(), 'ready');
+      const outcome = await idx2.search({ keyword: '全文检索' });
+      assert.equal(outcome.ready, true);
+      assert.ok(outcome.hits.some((h) => h.path === 'a.md'));
+      // The rebuild rewrote the disk copy with valid file names.
+      const repaired = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+      assert.deepEqual(repaired.fileNames, ['a.md', 'b.md']);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 isValidIndex: each cross-check rejects its damage and the rebuild heals', async () => {
+      const libDir = path.join(scratch, 'index-crosscheck-lib');
+      const cacheDir = path.join(scratch, 'index-crosscheck-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'a.md'), '# A\n\nhello world.\n');
+      await fs.writeFile(path.join(libDir, 'b.md'), '# B\n\nhello again.\n');
+      await idx.buildAll();
+      assert.equal(idx.getStatus(), 'ready');
+      const indexPath = path.join(idx.getCacheDir(), 'index.json');
+      // One damage per cross-check (fileNames is covered by the
+      // validation test above). Each iteration re-reads the current
+      // index file — the previous iteration's ensureReady rebuilt
+      // it — damages it, and loads it in a fresh instance.
+      const damages = {
+        'chunk.file not in files': (j) => { j.chunks[0].file = 'ghost.md'; },
+        // Append a copy instead of overwriting an id: overwriting
+        // also orphans the old id (b.md still points at it), so the
+        // chunkIds check would reject first and this rule would
+        // never be exercised. Appending keeps every id present and
+        // every other check green — only the duplicate-id check
+        // can reject it.
+        'duplicate chunk id': (j) => { j.chunks.push({ ...j.chunks[0] }); },
+        'file.chunkIds dangling': (j) => { j.files[Object.keys(j.files)[0]].chunkIds.push(424242); },
+        'posting dangling': (j) => { j.postings[Object.keys(j.postings)[0]]['99999'] = 3; },
+      };
+      for (const [name, damage] of Object.entries(damages)) {
+        const raw = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+        damage(raw);
+        await fs.writeFile(indexPath, JSON.stringify(raw));
+        const probe = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+        await probe.load();
+        // The key assertion: the status after load() is 'unbuilt',
+        // which proves the CHECK rejected the file — not that a
+        // later rebuild happened to fix it.
+        assert.equal(probe.getStatus(), 'unbuilt', `${name}: load() must reject the damaged index`);
+        await probe.ensureReady();
+        assert.equal(probe.getStatus(), 'ready');
+        const outcome = await probe.search({ keyword: 'hello' });
+        assert.equal(outcome.ready, true);
+        assert.equal(outcome.hits.length, 2, `${name}: the rebuild must restore both hits`);
+      }
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 search (auto-heal): a search-breaking in-memory index heals instead of reloading forever', async () => {
+      const libDir = path.join(scratch, 'index-autoheal-lib');
+      const cacheDir = path.join(scratch, 'index-autoheal-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'a.md'), '# A\n\n全文检索测试内容。\n');
+      await fs.writeFile(path.join(libDir, 'b.md'), '# B\n\n另一篇笔记。\n');
+      await idx.buildAll();
+      assert.equal(idx.getStatus(), 'ready');
+      // Corrupt the IN-MEMORY index only: the disk copy stays good
+      // on purpose. Any on-disk corruption that breaks search is now
+      // rejected by validation (see the tests above), so the only way
+      // to exercise distrustDisk is to break the loaded copy — a
+      // search then throws (path.basename(123)), the disk is marked
+      // distrusted, and ensureReady must rebuild instead of loading
+      // the good disk copy. Count buildAll calls to prove it: the
+      // only rebuild in this test is the one ensureReady triggers
+      // after the search throws. Without distrustDisk, ensureReady
+      // would load (0 builds) and still heal, so the heal alone
+      // would not discriminate — the count is the discriminator.
+      // (TS-private field, reachable at runtime from this .mjs test.)
+      const idx2 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      const origBuildAll = idx2.buildAll.bind(idx2);
+      let builds = 0;
+      idx2.buildAll = async () => { builds += 1; return origBuildAll(); };
+      await idx2.load();
+      assert.equal(idx2.getStatus(), 'ready');
+      idx2.data.fileNames = [123];
+      const first = await idx2.search({ keyword: '全文检索' });
+      assert.equal(first.ready, false, 'first search falls back while the index heals');
+      let healed = false;
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const outcome = await idx2.search({ keyword: '全文检索' });
+        if (outcome.ready) {
+          healed = true;
+          assert.ok(outcome.hits.some((h) => h.path === 'a.md'));
+          break;
+        }
+        // Give the background rebuild a moment before retrying.
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      assert.ok(healed, 'search must recover to the index within 10 attempts');
+      assert.equal(idx2.getStatus(), 'ready');
+      assert.equal(builds, 1, 'ensureReady rebuilt exactly once instead of loading');
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.1 buildAll: empty library + write failure still reports ready', async () => {
+      const libDir = path.join(scratch, 'index-build-failed-empty-lib');
+      const cacheDir = path.join(scratch, 'index-build-failed-empty-cache');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      // Block the write the same way as the F1 test.
+      const indexPath = path.join(idx.getCacheDir(), 'index.json');
+      await fs.mkdir(indexPath, { recursive: true });
+      assert.equal(await idx.buildAll(), 'failed');
+      // The swapped-in (empty) index is complete — only the write
+      // failed — so the status is 'ready', not 'unbuilt'. The old
+      // code keyed on totalChunks, which is 0 for an empty library.
+      assert.equal(idx.getStatus(), 'ready');
       delete process.env['MEMDRIVE_CACHE_DIR'];
     });
 

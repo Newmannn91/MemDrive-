@@ -181,9 +181,21 @@ export async function handleSearchFiles(ctx, keyword, inputPath, opts) {
         throw new MemDriveError('INVALID_ARGUMENT', 'search_files needs a keyword (omit it only for diagnostics_only).');
     }
     // Explicit rebuild (e.g. after a bulk import or a cache clear).
+    // When the rebuild does not run, say why instead of silently
+    // searching the old index: 'locked' (another process — or this
+    // process's own background build after a restart — is building)
+    // is not the same as 'failed' (the rebuild itself threw, F1).
+    let rebuildSkipped = false;
+    let rebuildFailed = false;
     if (opts.rebuildIndex === true) {
-        await ctx.searchIndex.buildAll();
+        const result = await ctx.searchIndex.buildAll();
+        rebuildSkipped = result === 'locked';
+        rebuildFailed = result === 'failed';
     }
+    const rebuildNote = rebuildFailed
+        ? 'Note: rebuild failed — the index could not be saved to disk. Try rebuild_index again, and check the server log if it keeps failing.'
+        : 'Note: rebuild skipped — the index is currently being built (by another MemDrive process or a background build); try rebuild_index again in a moment.';
+    const withRebuildNote = (text) => rebuildSkipped || rebuildFailed ? `${rebuildNote}\n\n${text}` : text;
     // Kick off the background build on first use; searches fall back to
     // a direct scan until it finishes.
     if (ctx.searchIndex.getStatus() === 'unbuilt') {
@@ -229,7 +241,7 @@ export async function handleSearchFiles(ctx, keyword, inputPath, opts) {
             ignored.push('exact_phrase');
         }
         if (hits.length === 0) {
-            return okResult(`No files matching ${JSON.stringify(keyword)} under ${rel}. (Search index is still building; this was a direct scan.)`);
+            return okResult(withRebuildNote(`No files matching ${JSON.stringify(keyword)} under ${rel}. (Search index is still building; this was a direct scan.)`));
         }
         const needle = keyword.toLowerCase();
         const pageHits = hits.slice(offset, offset + limit);
@@ -265,6 +277,9 @@ export async function handleSearchFiles(ctx, keyword, inputPath, opts) {
                 `Found ${hits.length} file(s) matching ${JSON.stringify(keyword)} under ${rel} (direct scan — search index is still building; showing ${offset + 1}–${offset + shown}):`,
                 '',
             ];
+            if (rebuildSkipped || rebuildFailed) {
+                lines.push(rebuildNote, '');
+            }
             if (hits.length >= SEARCH_MAX_RESULTS) {
                 lines.push(`Results capped at ${SEARCH_MAX_RESULTS}; narrow the keyword or path for more.`);
             }
@@ -277,16 +292,22 @@ export async function handleSearchFiles(ctx, keyword, inputPath, opts) {
         return okResult(fitted.text);
     }
     if (outcome.total === 0) {
-        return okResult(`No files matching ${JSON.stringify(keyword)} under ${rel}.`);
+        return okResult(withRebuildNote(`No files matching ${JSON.stringify(keyword)} under ${rel}.`));
     }
     const hitLines = outcome.hits.map((hit) => {
         const section = hit.section.length > 0 ? ` [${hit.section}]` : '';
         return `- ${hit.path}${section} (score ${hit.score.toFixed(2)}) — ${hit.snippet}`;
     });
-    const fitted = fitSearchOutput((shown) => [
-        `Found ${outcome.total} matching file(s) for ${JSON.stringify(keyword)} under ${rel} (showing ${offset + 1}–${offset + shown}):`,
-        '',
-    ], hitLines, (shown) => `More results available: pass offset ${offset + shown} (limit ${limit}) for the next page.`, outcome.total, offset, cap);
+    const fitted = fitSearchOutput((shown) => {
+        const header = [
+            `Found ${outcome.total} matching file(s) for ${JSON.stringify(keyword)} under ${rel} (showing ${offset + 1}–${offset + shown}):`,
+            '',
+        ];
+        if (rebuildSkipped || rebuildFailed) {
+            header.push(rebuildNote, '');
+        }
+        return header;
+    }, hitLines, (shown) => `More results available: pass offset ${offset + shown} (limit ${limit}) for the next page.`, outcome.total, offset, cap);
     return okResult(fitted.text);
 }
 /**
