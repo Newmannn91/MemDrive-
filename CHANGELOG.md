@@ -8,6 +8,18 @@ earlier versions were delivered as zips and verified by the
 protocol suite (see TEST-REPORT.md). Each section below maps
 to a GitHub Release.
 
+## [0.8.2] - 2026-11-09
+
+Registry metadata only — no behavior change. The search contract, tools and limits are unchanged; the code is 0.8.1 plus version strings.
+
+### Added
+
+- **MCP Registry entry.** `package.json` now carries `mcpName: "io.github.Newmannn91/memdrive-mcp"` and the repo ships a `server.json`, so the server can be published to the official MCP Registry (`mcp-publisher publish`). The Registry entry is what the other directories read: Glama already lists MemDrive (auto-indexed from the public repo), PulseMCP pulls from the Registry when its submissions reopen.
+
+### Notes
+
+- The lock half-write race and lock heartbeat from the original 0.8.2 plan move to 0.8.3 — this release is metadata-only.
+
 ## [0.8.1] - 2026-11-09
 
 Follow-up to the 0.8.0 search engine: three deferred review items (E, F, G). No new features; the search contract is unchanged.

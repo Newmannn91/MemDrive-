@@ -19,7 +19,7 @@ import { LocalStorageBackend } from './storage.js';
 import { registerTools } from './tools.js';
 import { runSetupWizard } from './wizard.js';
 
-const VERSION = '0.8.1';
+const VERSION = '0.8.2';
 
 async function main(): Promise<void> {
   // `node dist/index.js setup` runs the interactive setup wizard

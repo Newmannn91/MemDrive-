@@ -287,7 +287,7 @@ export function safeRequest(rawUrl, opts = {}) {
             ...(lookup !== undefined ? { lookup } : {}),
             ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
             headers: {
-                'User-Agent': 'memdrive-mcp/0.8.1',
+                'User-Agent': 'memdrive-mcp/0.8.2',
                 Accept: 'image/*',
                 ...opts.headers,
             },

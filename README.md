@@ -9,7 +9,7 @@ through six small tools. No cloud service, no account, no server to run —
 the MCP server runs on your own machine and touches only the folder you
 point it at.
 
-> **Status: 0.8.1.** Local filesystem backend only. Full-text search index with BM25 ranking (Chinese segmentation, filters, pagination, read-only diagnostics).
+> **Status: 0.8.2.** Local filesystem backend only. Full-text search index with BM25 ranking (Chinese segmentation, filters, pagination, read-only diagnostics).
 > 0.1.1 added one total response budget to `read_file` (see
 > [Reading back](#reading-back-packed-two-step-and-single-image) and
 > [Limits](#limits-all-in-srcconfigts-nowhere-else)) and put the

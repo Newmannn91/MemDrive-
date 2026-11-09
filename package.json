@@ -31,6 +31,7 @@
   ],
   "license": "MIT",
   "main": "dist/index.js",
+  "mcpName": "io.github.Newmannn91/memdrive-mcp",
   "name": "memdrive-mcp",
   "repository": {
     "type": "git",
@@ -44,5 +45,5 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "type": "module",
-  "version": "0.8.1"
+  "version": "0.8.2"
 }
