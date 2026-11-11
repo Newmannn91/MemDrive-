@@ -21,7 +21,7 @@
     "README.md",
     "LICENSE"
   ],
-  "homepage": "https://github.com/Newmannn91/MemDrive-",
+  "homepage": "https://github.com/Newmannn91/MemDrive",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -35,7 +35,7 @@
   "name": "memdrive-mcp",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Newmannn91/MemDrive-.git"
+    "url": "git+https://github.com/Newmannn91/MemDrive.git"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -45,5 +45,5 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "type": "module",
-  "version": "0.8.3"
+  "version": "0.8.4"
 }

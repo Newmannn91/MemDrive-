@@ -346,6 +346,117 @@ async function main() {
       assert.equal(await fs.readFile(path.join(root, 'notes/2026/deep/note.md'), 'utf8'), 'replaced+more');
     });
 
+    // Fresh cache dir server to test the one-time first-save tag reminder
+    // without reusing the main server's cache (which already has the marker
+    // from the save_file calls above).
+    const tagReminderCacheBase = path.join(scratch, 'index-cache-tag-reminder');
+    let reminderTransport = null;
+    let reminderClient = null;
+    try {
+      reminderTransport = new StdioClientTransport({
+        command: process.execPath,
+        args: [SERVER],
+        env: {
+          ...process.env,
+          MEMDRIVE_ROOT: root,
+          MEMDRIVE_CACHE_DIR: tagReminderCacheBase,
+        },
+        stderr: 'pipe',
+      });
+      reminderClient = new Client(
+        { name: 'memdrive-protocol-test-tag-reminder', version: '0.1.0' },
+        { capabilities: {} },
+      );
+      await reminderClient.connect(reminderTransport);
+      const reminderCall = async (name, args) =>
+        reminderClient.callTool({ name, arguments: args });
+
+      await check('first save_file with fresh cache includes one-time tag tip', async () => {
+        const res = await reminderCall('save_file', {
+          path: 'notes/tag-reminder-1.md',
+          content: '# First\n',
+          mode: 'new',
+        });
+        assert.equal(res.isError, undefined, textOf(res));
+        assert.match(textOf(res), /tag notes with/i);
+      });
+
+      await check('second save_file omits tag tip once shown', async () => {
+        const res = await reminderCall('save_file', {
+          path: 'notes/tag-reminder-2.md',
+          content: '# Second\n',
+          mode: 'new',
+        });
+        assert.equal(res.isError, undefined, textOf(res));
+        assert.doesNotMatch(textOf(res), /tag notes with/i);
+      });
+
+      await check('tag-reminder-shown marker exists in per-library cache dir', async () => {
+        const rootReal = await fs.realpath(root);
+        const subdir = createHash('sha256').update(rootReal).digest('hex').slice(0, 16);
+        const markerPath = path.join(tagReminderCacheBase, subdir, 'tag-reminder-shown');
+        const stat = await fs.stat(markerPath);
+        assert.equal(stat.isFile(), true);
+      });
+    } finally {
+      await reminderClient?.close().catch(() => undefined);
+      await reminderTransport?.close().catch(() => undefined);
+    }
+
+    // Unwritable cache dir: the marker can never be written, so without
+    // the in-process guard the tip would repeat on every save. Block the
+    // cache subdir with a regular file, then save twice: both saves must
+    // succeed and the tip must appear at most once.
+    const blockedCacheBase = path.join(scratch, 'index-cache-blocked');
+    const rootRealBlocked = await fs.realpath(root);
+    const blockedSubdir = createHash('sha256').update(rootRealBlocked).digest('hex').slice(0, 16);
+    await fs.mkdir(blockedCacheBase, { recursive: true });
+    await fs.writeFile(path.join(blockedCacheBase, blockedSubdir), 'not a directory', 'utf8');
+    let blockedTransport = null;
+    let blockedClient = null;
+    try {
+      blockedTransport = new StdioClientTransport({
+        command: process.execPath,
+        args: [SERVER],
+        env: {
+          ...process.env,
+          MEMDRIVE_ROOT: root,
+          MEMDRIVE_CACHE_DIR: blockedCacheBase,
+        },
+        stderr: 'pipe',
+      });
+      blockedClient = new Client(
+        { name: 'memdrive-protocol-test-tag-reminder-blocked', version: '0.1.0' },
+        { capabilities: {} },
+      );
+      await blockedClient.connect(blockedTransport);
+      const blockedCall = async (name, args) =>
+        blockedClient.callTool({ name, arguments: args });
+
+      await check('unwritable cache dir: first save still succeeds and shows the tag tip once', async () => {
+        const res = await blockedCall('save_file', {
+          path: 'notes/tag-reminder-blocked-1.md',
+          content: '# Blocked first\n',
+          mode: 'new',
+        });
+        assert.equal(res.isError, undefined, textOf(res));
+        assert.match(textOf(res), /tag notes with/i);
+      });
+
+      await check('unwritable cache dir: second save still succeeds and does not repeat the tag tip', async () => {
+        const res = await blockedCall('save_file', {
+          path: 'notes/tag-reminder-blocked-2.md',
+          content: '# Blocked second\n',
+          mode: 'new',
+        });
+        assert.equal(res.isError, undefined, textOf(res));
+        assert.doesNotMatch(textOf(res), /tag notes with/i);
+      });
+    } finally {
+      await blockedClient?.close().catch(() => undefined);
+      await blockedTransport?.close().catch(() => undefined);
+    }
+
     await check('save_file with local image archives to assets/ + appends ref', async () => {
       const res = await call('save_file', {
         path: 'notes/with-photo.md',
@@ -2325,6 +2436,22 @@ async function main() {
         extractTags('---\ntags: [#a, #b] # my tags\n---\nbody\n').sort(),
         ['a', 'b'].sort(),
       );
+      // 0.8.4: unpaired quote inside a flow list falls back to first `[` .. last `]`.
+      assert.deepEqual(
+        extractTags("---\ntags: [it's, b]\n---\nbody\n").sort(),
+        ["it's", 'b'].sort(),
+      );
+      // Strict bracket path still handles `]` inside paired quotes without cutting early
+      // (`a]b` itself is rejected by addTag's bracket gate, leaving `c`).
+      assert.deepEqual(
+        extractTags('---\ntags: ["a]b", c]\n---\nbody\n').sort(),
+        ['c'].sort(),
+      );
+      // Multiline flow list (no closing `]` on the `tags:` line) still yields nothing.
+      assert.deepEqual(
+        extractTags('---\ntags: [\n  a,\n  b\n]\n---\nbody\n').sort(),
+        [].sort(),
+      );
       // Sonnet final review: the addTag allowlist dropped
       // legitimate front-matter tags with spaces or dots
       // (`machine learning`, `node.js`, `c++`) — only real dirty
@@ -2599,6 +2726,19 @@ async function main() {
       await fs.utimes(path.join(libDir, 'assets', 'orphan.png'), old, old);
       await fs.writeFile(path.join(libDir, 'assets', 'used.png'), smallPng);
       await fs.writeFile(path.join(libDir, 'uses.md'), '# U\n\n![used](assets/used.png)\n');
+      await fs.writeFile(
+        path.join(libDir, 'tag-inline.md'),
+        '---\ntags: [alpha, shared]\n---\n\n# Inline\n\nBody.\n',
+      );
+      await fs.writeFile(
+        path.join(libDir, 'tag-block.md'),
+        '---\ntags:\n  - beta\n  - shared\n---\n\n# Block\n\nBody.\n',
+      );
+      await fs.writeFile(
+        path.join(libDir, 'tag-body.md'),
+        '# Body Tags\n\nSome text with #gamma and #alpha inline.\n',
+      );
+      const { formatDiagnostics } = await import('../dist/tools.js');
       const diag = await idx.scanDiagnostics();
       assert.deepEqual(diag.emptyFiles, ['empty.md']);
       assert.equal(diag.duplicateGroups.length, 1);
@@ -2608,6 +2748,84 @@ async function main() {
         ['broken.md:assets/also-gone.png', 'broken.md:assets/gone.png'],
       );
       assert.deepEqual(diag.orphanCandidates, ['assets/orphan.png']);
+      assert.deepEqual(diag.tags, [
+        { tag: 'alpha', count: 2 },
+        { tag: 'beta', count: 1 },
+        { tag: 'gamma', count: 1 },
+        { tag: 'shared', count: 2 },
+      ]);
+      const report = formatDiagnostics(diag);
+      assert.ok(
+        report.includes(
+          'Tags in use (4):\n- alpha (2)\n- beta (1)\n- gamma (1)\n- shared (2)',
+        ),
+      );
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.4 index (class): diagnostics tags match when index is ready', async () => {
+      const libDir = path.join(scratch, 'index-diag-ready-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-diag-ready-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(
+        path.join(libDir, 'tag-inline.md'),
+        '---\ntags: [alpha, shared]\n---\n\n# Inline\n\nBody.\n',
+      );
+      await fs.writeFile(
+        path.join(libDir, 'tag-block.md'),
+        '---\ntags:\n  - beta\n  - shared\n---\n\n# Block\n\nBody.\n',
+      );
+      await fs.writeFile(
+        path.join(libDir, 'tag-body.md'),
+        '# Body Tags\n\nSome text with #gamma and #alpha inline.\n',
+      );
+      await idx.buildAll();
+      const diag = await idx.scanDiagnostics();
+      assert.deepEqual(diag.tags, [
+        { tag: 'alpha', count: 2 },
+        { tag: 'beta', count: 1 },
+        { tag: 'gamma', count: 1 },
+        { tag: 'shared', count: 2 },
+      ]);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.4 index (class): diagnostics tags fall back to fresh text on stale index entry', async () => {
+      const libDir = path.join(scratch, 'index-diag-stale-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-diag-stale-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      const notePath = path.join(libDir, 'note.md');
+      await fs.writeFile(notePath, '---\ntags: [oldtag]\n---\n\n# N\n\nBody.\n');
+      await fs.writeFile(path.join(libDir, 'other.md'), '# O\n\nWith #shared tag.\n');
+      await idx.buildAll();
+      // Edit note without rebuilding; change size and mtime so the index entry is stale.
+      await fs.writeFile(notePath, '---\ntags: [newtag, shared]\n---\n\n# N\n\nUpdated body text.\n');
+      const future = new Date(Date.now() + 5000);
+      await fs.utimes(notePath, future, future);
+      const diag = await idx.scanDiagnostics();
+      assert.deepEqual(diag.tags, [
+        { tag: 'newtag', count: 1 },
+        { tag: 'shared', count: 2 },
+      ]);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.4 index (class): diagnostics reports empty tag list when no tags exist', async () => {
+      const libDir = path.join(scratch, 'index-diag-notags-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-diag-notags-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      await fs.writeFile(path.join(libDir, 'plain.md'), '# Plain\n\nNo tags here.\n');
+      const { formatDiagnostics } = await import('../dist/tools.js');
+      const diag = await idx.scanDiagnostics();
+      assert.deepEqual(diag.tags, []);
+      const report = formatDiagnostics(diag);
+      assert.ok(report.includes('Tags in use (0): none'));
       delete process.env['MEMDRIVE_CACHE_DIR'];
     });
 

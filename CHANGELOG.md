@@ -8,6 +8,22 @@ earlier versions were delivered as zips and verified by the
 protocol suite (see TEST-REPORT.md). Each section below maps
 to a GitHub Release.
 
+## [0.8.4] - 2026-11-11
+
+Tags release: the tag work planned for 0.8.3 lands here — guidance, a first-save tip, and a diagnostics tag list — plus a flow-list quote fix and a trimmed read_file description.
+
+### Added
+
+- **Tag guidance in the save_file description.** The tool now explains the two tag syntaxes (YAML front matter `tags:` or body `#tag`) and when to suggest adding tags: only when the user mentions a category/topic while saving, when the note clearly belongs to a tag already in the library, or when several notes on the same topic are saved in a row (asked once). It never asks for quick screenshot/clipboard saves, when the user only said "save it" with no topic signal, or after already asking once in the conversation. An explicit request to save with tags just saves.
+- **One-time tag tip on first save.** The first successful save in a library appends a tip about tagging notes; later saves do not repeat it. The marker lives in the per-library cache dir next to the index and is best-effort — a marker write failure never fails the save. The save_file description requires the model to relay the tip to the user when it appears (the server can only ask, not guarantee it).
+- **Diagnostics lists tags in use.** The diagnostics report ends with a `Tags in use (N):` section — each tag once, alphabetically, with its file count. It is a descriptive reuse list, not a controlled vocabulary. No tags: `Tags in use (0): none`.
+- **README Tags section.** Documents the two syntaxes and the `search_files` `tags` filter (a file must carry at least one listed tag to match).
+
+### Fixed
+
+- **Flow list with an unpaired single quote.** `tags: [it's, b]` now yields `it's` and `b` — the strict bracket regex used to fail and return nothing. The fallback only runs when the strict parse fails and the line contains a `]`; a multiline flow list still yields nothing.
+- **read_file description trimmed.** The TOTAL RESPONSE BUDGET paragraph keeps the three layers (host ~1 MB, server 950,000-byte budget, model pixel-to-token conversion) and drops the v0.1.1 history anecdote and the "other hosts untested" note; it now says read_file returns a budget-fitting preview and to use open_image for the original.
+
 ## [0.8.3] - 2026-11-10
 
 Bug-fix release (Argon review of 0.8.2 + Muse verification + Sonnet cross-review). The search contract, tools and limits are unchanged.

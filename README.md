@@ -478,6 +478,20 @@ always kept at full quality.
 filename and get your confirmation in the chat. There is no popup — the
 confirmation happens in the conversation.
 
+### Tags
+
+Notes can be tagged in two ways:
+
+- YAML front matter `tags:` — inline (`tags: [a, b]`) or a block list (`- a`).
+- `#tag` in the note body.
+
+To filter search results by tag, pass `tags` to `search_files`; a file
+must carry at least one of the listed tags to match.
+
+Tags are free-form with no controlled vocabulary; the diagnostics report
+(`diagnostics_only`) lists the tags already in use in the library so they
+can be reused.
+
 ### Clipboard edge cases
 
 - Clipboard empty or holding text instead of an image: the text is still

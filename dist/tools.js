@@ -14,7 +14,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
-import { IMAGE_PREVIEW_MAX_BYTES, READ_MAX_IMAGES, SAVE_IMAGES_MAX_DOWNLOAD_BYTES, SAVE_IMAGES_MAX_TOTAL_BYTES, SAVE_MAX_IMAGES, SEARCH_MAX_RESULTS, SVG_EXTENSION, TEXT_MAX_BYTES, resolveResponseBudgetBytes, resolveSearchMaxBytes, } from './config.js';
+import { IMAGE_PREVIEW_MAX_BYTES, READ_MAX_IMAGES, SAVE_IMAGES_MAX_DOWNLOAD_BYTES, SAVE_IMAGES_MAX_TOTAL_BYTES, SAVE_MAX_IMAGES, SEARCH_MAX_RESULTS, SVG_EXTENSION, TEXT_MAX_BYTES, resolveIndexCacheDir, resolveResponseBudgetBytes, resolveSearchMaxBytes, } from './config.js';
 import { MemDriveError, NotFoundError } from './errors.js';
 import { acquireImage, base64Length, detectImageMime, encodeImageSrc, extensionForMime, makePreview, maxBinaryForBase64Budget, mimeFromExtension, scanMarkdownImages, } from './images.js';
 import { assertInsideRealRoot, isInside, sandboxPath, sandboxPathForWrite, toDisplayPath, } from './sandbox.js';
@@ -135,7 +135,7 @@ function searchOutputCapBytes() {
     return Math.min(resolveSearchMaxBytes(process.env['MEMDRIVE_SEARCH_MAX_BYTES']), responseBudgetBytes());
 }
 /** Format a read-only diagnostics report (0.9.0 maintenance preview; never modifies anything). */
-function formatDiagnostics(diag) {
+export function formatDiagnostics(diag) {
     const lines = ['Library diagnostics (read-only — nothing was modified):', ''];
     lines.push(`Empty files (${diag.emptyFiles.length}):`);
     for (const f of diag.emptyFiles) {
@@ -152,6 +152,15 @@ function formatDiagnostics(diag) {
     lines.push('', `Orphan attachment candidates (${diag.orphanCandidates.length}, unreferenced images older than 24h):`);
     for (const f of diag.orphanCandidates) {
         lines.push(`- ${f}`);
+    }
+    if (diag.tags.length === 0) {
+        lines.push('', 'Tags in use (0): none');
+    }
+    else {
+        lines.push('', `Tags in use (${diag.tags.length}):`);
+        for (const { tag, count } of diag.tags) {
+            lines.push(`- ${tag} (${count})`);
+        }
     }
     return lines.join('\n');
 }
@@ -352,6 +361,14 @@ function fitSearchOutput(headerFor, hitLines, moreFor, total, offset, cap) {
         }
     }
 }
+const TAG_REMINDER_MARKER = 'tag-reminder-shown';
+const TAG_REMINDER_TIP = 'Tip: you can tag notes with front matter `tags:` or body `#tag`s to find them later.';
+// In-process guard for the one-time tag reminder: if the marker file
+// cannot be written (unwritable cache dir), the reminder would
+// otherwise repeat on every save. Track shown cache dirs so each
+// library's tip appears at most once per process (the marker file
+// itself is per-library, so the guard is keyed the same way).
+const tagTipShownCacheDirs = new Set();
 async function handleSaveFile(ctx, inputPath, content, mode, imageSpecs) {
     // Writes get the cross-platform segment check (reserved names,
     // ADS, trailing dot/space); reads do not, so files synced in
@@ -475,6 +492,31 @@ async function handleSaveFile(ctx, inputPath, content, mode, imageSpecs) {
         }
         for (const note of notes) {
             lines.push(`Note: ${note}`);
+        }
+        // One-time tag reminder per library cache dir (best-effort: a marker
+        // check or write failure must never fail the save). Note: the server
+        // can only append the tip and instruct the model in the tool description
+        // to relay it; it cannot guarantee the model actually says it every time.
+        try {
+            const cacheDir = resolveIndexCacheDir(ctx.rootRealDir);
+            const markerPath = path.join(cacheDir, TAG_REMINDER_MARKER);
+            let markerExists = false;
+            try {
+                await fs.access(markerPath);
+                markerExists = true;
+            }
+            catch {
+                markerExists = false;
+            }
+            if (!markerExists && !tagTipShownCacheDirs.has(cacheDir)) {
+                tagTipShownCacheDirs.add(cacheDir);
+                lines.push(TAG_REMINDER_TIP);
+                await fs.mkdir(cacheDir, { recursive: true });
+                await fs.writeFile(markerPath, '', 'utf8');
+            }
+        }
+        catch {
+            // Best-effort only; never fail a save over the reminder marker.
         }
         return okResult(lines.join('\n'));
     }
@@ -983,6 +1025,7 @@ export function registerTools(server, backend, rootDir, rootRealDir, searchIndex
             SAVE_GUIDANCE,
             'Save text (usually Markdown) into the MemDrive memory library.',
             'Modes: "new" (default) fails when the file already exists; "overwrite" replaces it; "append" adds to the end, creating the file when missing. Parent directories are created automatically.',
+            'Tags: two syntaxes are supported — YAML front matter `tags:` (inline `[a, b]` or block `- a`) and body `#tag`. Proactively suggest adding tags ONLY in these three cases: (1) the user mentions a category or topic while saving (e.g. saving a work plan); (2) the note clearly belongs to a tag already used in the library; (3) the user saves several notes on the same topic in a row (ask once, e.g. whether to tag all of them X). NEVER ask about tags for quick screenshot/clipboard saves, when the user only said "save it" with no topic signal, or after you already asked once in this conversation and the user ignored it or said no. When the user explicitly asks to save with tags, just save with those tags — none of the rules above apply. If the tool result includes a `Tip:` line about tagging, you MUST say that tip to the user.',
             'Images: pass an "images" array with any mix of the literal string "clipboard" (capture the latest screenshot from the OS clipboard — see the clipboard rule above), local file paths, or http(s) image URLs. Images are copied/downloaded/captured into a sibling assets/ folder, renamed "<document-name>-<timestamp>.<ext>", and for Markdown files a standard image reference is appended to the document automatically. The on-disk original is always kept at full quality; only the preview handed to a model is ever downscaled.',
             'Clipboard behavior: when the clipboard is empty or holds text instead of an image, the text is still saved and the result explains what to do (re-screenshot). Clipboard capture never crashes the server; in headless environments it reports itself as unsupported and suggests a file path or URL instead.',
             'Paths are relative to the library root (MEMDRIVE_ROOT). Absolute paths are accepted only when they stay inside the root. The root is a hard sandbox: "../" escapes and symlinks pointing outside are rejected.',
@@ -1007,7 +1050,7 @@ export function registerTools(server, backend, rootDir, rootRealDir, searchIndex
     server.registerTool('read_file', {
         description: [
             'Read a file from the MemDrive memory library.',
-            'TOTAL RESPONSE BUDGET — THREE LIMITS ON THREE DIFFERENT LAYERS. (1) HOST: the MCP host (Claude Desktop, the only host verified so far) rejects a whole tool result over about 1 MB ("Tool result is too large. Maximum size is 1MB"). That limit lives in the host, outside this server, and is NOT a model or context-window limit; other hosts (ChatGPT, Grok) are untested, so this server assumes the same ~1 MB ceiling for all of them. (2) SERVER: text bytes plus the base64 bytes of every image block in one response must together fit inside a single total budget — default 950,000 bytes, overridable with MEMDRIVE_RESPONSE_BUDGET_BYTES (clamped to 100,000–50,000,000) — a safety margin under the host limit. Text comes first and is guaranteed; images share only the budget the text leaves. An image that does not fit is downscaled in memory to fit it, or skipped with a note — a read never fails as a whole because of an image. The file on disk is never modified. Previews are built at full resolution first, trying higher JPEG quality before shrinking, so a preview uses the budget for sharpness instead of stopping far below it. At the default budget the effective per-image cap is about 712,000 binary bytes (after base64 inflation), so the separate 3.5 MB per-image preview ceiling only binds when the budget is raised for a host with a larger limit. HISTORY: before v0.1.1 this server had NO total budget, so a bundled read whose base64 exceeded the host limit was rejected wholesale by the host — that is what happened to the first read of an 813.5 KB image (~1.11 MB as base64). (3) MODEL: once the model receives an image it scales it by pixels into tokens under its own limits — a separate layer from the byte limits above, not something this server controls.',
+            'TOTAL RESPONSE BUDGET — THREE LIMITS ON THREE DIFFERENT LAYERS. (1) HOST: the MCP host rejects a whole tool result over about 1 MB ("Tool result is too large. Maximum size is 1MB"), a host limit outside this server and separate from the model context window. (2) SERVER: text bytes plus base64 image bytes in one response must fit a single total budget — default 950,000 bytes, overridable with MEMDRIVE_RESPONSE_BUDGET_BYTES (clamped to 100,000–50,000,000). Text is guaranteed first; images share what remains and are downscaled in memory (trying higher JPEG quality before shrinking dimensions) or skipped with a note so a read never fails over an image and the file on disk is never modified. read_file returns a preview that fits the budget; to view the original image on disk, use open_image (only when the user asks). (3) MODEL: the model converts image pixels into tokens under its own limits, unrelated to the byte limits above.',
             'TWO-STEP READING — USE THIS WHENEVER A DOCUMENT REFERENCES SEVERAL IMAGES, OR ONE LARGE IMAGE: Step 1, call read_file with include_images=false to read the text and get the list of referenced image paths. Step 2, call read_file once per referenced image, passing that image path itself as path, so the image alone gets the whole response budget and keeps the best quality the budget allows. Reading an image file directly is also limited by the same total budget: a single image is returned untouched when it fits, and downscaled in memory only when the image itself exceeds the budget.',
             'Text files: returned as text (truncated at the smaller of the 1 MB text cap and the total budget, with a note when truncated).',
             'Markdown files: with include_images=true (the default), the text is returned TOGETHER WITH every locally-referenced image that fits the remaining budget in the same response — each image becomes an image content block, so the model sees words and pictures together. Remote (http) and data: images are skipped with a note. Images over the 3.5 MB preview cap are downscaled in memory only; the file on disk is never modified.',

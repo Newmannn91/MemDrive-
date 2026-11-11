@@ -506,6 +506,16 @@ export function extractTags(text) {
                     addTag(part);
                 }
             }
+            else if (value.startsWith('[')) {
+                // Fallback for an unpaired quote inside `[...]` (e.g. `[it's, b]`):
+                // take up to the last `]` on the line; multiline flow lists have no `]`.
+                const closeIdx = value.lastIndexOf(']');
+                if (closeIdx > 0) {
+                    for (const part of value.slice(1, closeIdx).split(',')) {
+                        addTag(part);
+                    }
+                }
+            }
             else if (!value.startsWith('[')) {
                 const raw = stripYamlComment(value);
                 for (const part of raw.split(',')) {
@@ -1965,6 +1975,8 @@ export class LocalSearchIndex {
         const emptyFiles = [];
         const byHash = new Map();
         const brokenImageRefs = [];
+        const tagCounts = new Map();
+        const underScope = (p) => scope === undefined || scope === '' || p === scope || p.startsWith(`${scope}/`);
         const referenced = new Set();
         const maxBytes = resolveIndexMaxFileBytes(process.env['MEMDRIVE_INDEX_MAX_BYTES']);
         const indexReady = this.status === 'ready';
@@ -2037,8 +2049,10 @@ export class LocalSearchIndex {
                 group.push(file.relPath);
                 byHash.set(hash, group);
             }
+            let markdownText = null;
             if (isMarkdown && data !== null) {
-                const text = data.toString('utf8');
+                markdownText = data.toString('utf8');
+                const text = markdownText;
                 for (const ref of scanMarkdownImages(text)) {
                     const resolved = await this.resolveImageRef(file.relPath, ref, imageByName);
                     if (resolved.status === 'ok') {
@@ -2054,6 +2068,28 @@ export class LocalSearchIndex {
                     else {
                         brokenImageRefs.push({ file: file.relPath, src: ref.src });
                     }
+                }
+            }
+            if (underScope(file.relPath)) {
+                let fileTags = [];
+                if (indexReady) {
+                    // Use the indexed tags only when the entry is fresh; a new or
+                    // edited file (diagnostics does not refresh the index first)
+                    // falls back to the text already read for image refs.
+                    if (indexEntry !== undefined &&
+                        indexEntry.mtimeMs === file.mtimeMs &&
+                        indexEntry.size === file.size) {
+                        fileTags = indexEntry.tags;
+                    }
+                    else if (markdownText !== null) {
+                        fileTags = extractTags(markdownText);
+                    }
+                }
+                else if (markdownText !== null) {
+                    fileTags = extractTags(markdownText);
+                }
+                for (const tag of fileTags) {
+                    tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
                 }
             }
             await LocalSearchIndex.yieldLoop();
@@ -2076,6 +2112,9 @@ export class LocalSearchIndex {
             }
             orphanCandidates.push(file.relPath);
         }
+        const tags = [...tagCounts.entries()]
+            .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+            .map(([tag, count]) => ({ tag, count }));
         if (scope !== undefined && scope !== '') {
             const under = (p) => p === scope || p.startsWith(`${scope}/`);
             return {
@@ -2085,9 +2124,10 @@ export class LocalSearchIndex {
                     .filter((g) => g.length > 1),
                 brokenImageRefs: brokenImageRefs.filter((r) => under(r.file)),
                 orphanCandidates: orphanCandidates.filter(under),
+                tags,
             };
         }
-        return { emptyFiles, duplicateGroups, brokenImageRefs, orphanCandidates };
+        return { emptyFiles, duplicateGroups, brokenImageRefs, orphanCandidates, tags };
     }
     /**
      * Resolve one image reference from a note. Inline, `<img>`, and
