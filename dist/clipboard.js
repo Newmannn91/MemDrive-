@@ -49,6 +49,17 @@ function detectMime(data) {
     }
     return null;
 }
+/**
+ * Run a clipboard command. `ranOk` is true only when the command
+ * exited 0. That alone cannot separate "the tool ran and found
+ * nothing" (empty clipboard) from "the tool exists but cannot run"
+ * (no desktop session): xclip exits 1 in BOTH cases — a real X
+ * session with an empty clipboard prints "Error: target STRING not
+ * available" (exit 1), and no display prints "Error: Can't open
+ * display" (exit 1). The stderr text is the only signal that
+ * tells them apart, so it is returned alongside the outcome.
+ * `stderr` is the command's stderr on failure, '' on success.
+ */
 async function runBuffer(command, args) {
     try {
         const { stdout } = await execFileAsync(command, args, {
@@ -56,12 +67,14 @@ async function runBuffer(command, args) {
             maxBuffer: CLIPBOARD_MAX_BYTES,
             timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
             windowsHide: true,
+            env: { ...process.env, LC_ALL: 'C' },
         });
         const out = stdout;
-        return out.length > 0 ? out : null;
+        return { data: out.length > 0 ? out : null, ranOk: true, stderr: '' };
     }
-    catch {
-        return null;
+    catch (error) {
+        const stderr = (error.stderr ?? '').toString();
+        return { data: null, ranOk: false, stderr };
     }
 }
 async function runText(command, args) {
@@ -71,13 +84,38 @@ async function runText(command, args) {
             maxBuffer: CLIPBOARD_MAX_BYTES,
             timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
             windowsHide: true,
+            env: { ...process.env, LC_ALL: 'C' },
         });
         const text = stdout.trim();
-        return text.length > 0 ? text : null;
+        return { text: text.length > 0 ? text : null, ranOk: true, stderr: '' };
     }
-    catch {
-        return null;
+    catch (error) {
+        const stderr = (error.stderr ?? '').toString();
+        return { text: null, ranOk: false, stderr };
     }
+}
+/**
+ * True when a clipboard command's stderr shows it reached a live
+ * desktop session but found nothing on the clipboard (empty), as
+ * opposed to having no session at all:
+ *   xclip:   "Error: target STRING not available" = empty;
+ *            "Error: Can't open display" = no session.
+ *   wl-paste: "Nothing is copied" = empty;
+ *             "No suitable type of content copied" = empty (the
+ *             clipboard holds something, but not the requested
+ *             image/png or text/plain — nothing usable to capture);
+ *             "Failed to connect to a Wayland server" = no session.
+ *             ("Clipboard content is not available as requested
+ *             type ..." contains "not available", so it is already
+ *             covered; only "No suitable type" needed adding —
+ *             Argon round 5.)
+ * A `which` check cannot make that distinction, and neither can
+ * the exit code — only the stderr text can.
+ */
+function stderrMeansEmpty(stderr) {
+    return (stderr.includes('not available') ||
+        stderr.includes('Nothing is copied') ||
+        stderr.includes('No suitable type'));
 }
 /** macOS: ask AppleScript to write the clipboard PNG to a temp file. */
 async function readMacOs() {
@@ -182,12 +220,20 @@ async function readWindows() {
 }
 /** Linux: Wayland (wl-paste) first, then X11 (xclip). */
 async function readLinux() {
+    // A command counts as "ran" when it exited 0 (even with empty
+    // output) OR when its stderr shows it reached a live session
+    // but found nothing on the clipboard. The exit code alone
+    // cannot tell "empty clipboard" from "no desktop session":
+    // xclip exits 1 for both, so only the stderr text separates
+    // them (see stderrMeansEmpty).
+    let anyRanOk = false;
     const imageCommands = [
         ['wl-paste', ['--type', 'image/png']],
         ['xclip', ['-selection', 'clipboard', '-t', 'image/png', '-o']],
     ];
     for (const [command, args] of imageCommands) {
-        const data = await runBuffer(command, args);
+        const { data, ranOk, stderr } = await runBuffer(command, args);
+        anyRanOk = anyRanOk || ranOk || stderrMeansEmpty(stderr);
         if (data !== null) {
             const mimeType = detectMime(data);
             if (mimeType !== null) {
@@ -201,13 +247,19 @@ async function readLinux() {
         ['xclip', ['-selection', 'clipboard', '-o']],
     ];
     for (const [command, args] of textCommands) {
-        const text = await runText(command, args);
+        const { text, ranOk, stderr } = await runText(command, args);
+        anyRanOk = anyRanOk || ranOk || stderrMeansEmpty(stderr);
         if (text !== null) {
             return { kind: 'text', text };
         }
     }
-    // Distinguish "no clipboard tool at all" from "clipboard empty" only
-    // loosely: both end here in headless environments.
+    // A clipboard tool ran and returned nothing: the clipboard is
+    // empty, not "unsupported". When nothing ran at all — no tool,
+    // or the tool exists but has no desktop session — clipboard
+    // access is unavailable in this environment (0.8.2 #12).
+    if (anyRanOk) {
+        return { kind: 'empty' };
+    }
     return {
         kind: 'unsupported',
         reason: 'Clipboard access is not available in this environment (no wl-paste/xclip, or no desktop session). Use a file path or image URL instead.',

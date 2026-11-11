@@ -213,7 +213,7 @@ export const BM25_B = 0.75;
 export const RRF_K = 60;
 
 /** On-disk index format version; a mismatch triggers a rebuild. */
-export const INDEX_FORMAT_VERSION = 2;
+export const INDEX_FORMAT_VERSION = 3;
 
 /** Age after which a lock file is treated as stale and may be stolen. */
 export const INDEX_LOCK_TIMEOUT_MS = 30_000;

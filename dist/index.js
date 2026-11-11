@@ -16,7 +16,7 @@ import { LocalSearchIndex } from './search-index.js';
 import { LocalStorageBackend } from './storage.js';
 import { registerTools } from './tools.js';
 import { runSetupWizard } from './wizard.js';
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 async function main() {
     // `node dist/index.js setup` runs the interactive setup wizard
     // instead of the MCP server. Without a host argument the wizard

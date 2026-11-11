@@ -136,6 +136,18 @@ export function tokenizeQuery(query) {
     return [...new Set(tokenize(query))];
 }
 /**
+ * Local-midnight date from components. `new Date(y, m, d)` maps
+ * years 0–99 to 1900–1999 (a JS quirk), so `setFullYear` is used:
+ * a note dated in year 50 would otherwise fail its component
+ * check and fall back to mtime.
+ */
+function localDate(y, m, d) {
+    const dt = new Date(0);
+    dt.setFullYear(y, m - 1, d);
+    dt.setHours(0, 0, 0, 0);
+    return dt;
+}
+/**
  * Parse a date filter bound. A date-only value (`YYYY-MM-DD`) on an
  * upper bound means the end of that day (23:59:59.999), so a note
  * dated that afternoon is still included. An unparseable value is
@@ -146,12 +158,33 @@ export function parseDateBound(raw, endOfDay) {
         return null;
     }
     const trimmed = raw.trim();
+    // A bare date ("2026-10-28") means that calendar day in the
+    // server's local timezone — NOT UTC midnight. `new Date` parses
+    // an ISO date-only string as UTC, which in UTC+8 shifts the bound
+    // 8 hours into the day: `modified_after: "2026-10-28"` would then
+    // miss files modified that morning. Parse it as local time.
+    const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+    if (dateOnly !== null) {
+        const y = Number(dateOnly[1]);
+        const m = Number(dateOnly[2]);
+        const d = Number(dateOnly[3]);
+        // A date that does not exist must not roll over (Feb 31 -> Mar 3).
+        const local = localDate(y, m, d);
+        if (local.getFullYear() !== y ||
+            local.getMonth() !== m - 1 ||
+            local.getDate() !== d) {
+            throw new MemDriveError('INVALID_DATE', `Invalid date: ${JSON.stringify(raw)}`);
+        }
+        if (endOfDay) {
+            const end = localDate(y, m, d);
+            end.setHours(23, 59, 59, 999);
+            return end.getTime();
+        }
+        return local.getTime();
+    }
     const ms = new Date(trimmed).getTime();
     if (Number.isNaN(ms)) {
         throw new MemDriveError('INVALID_DATE', `Invalid date: ${JSON.stringify(raw)}`);
-    }
-    if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-        return ms + 24 * 3600 * 1000 - 1;
     }
     return ms;
 }
@@ -404,17 +437,53 @@ function splitUnits(text) {
     flushPara(paraEnd);
     return units;
 }
+/** Strip CommonMark fenced code blocks (3+ backticks or tildes, <=3 spaces indent, CRLF-safe). */
+function stripFencedCode(text) {
+    const out = [];
+    let fence = null;
+    for (const line of text.split(/\r?\n/)) {
+        const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+        if (fence === null) {
+            // A backtick fence's info string may not contain a backtick.
+            if (m !== null && !(m[1][0] === '`' && m[2].includes('`'))) {
+                fence = { ch: m[1][0], len: m[1].length };
+                continue;
+            }
+        }
+        else if (m !== null && m[1][0] === fence.ch && m[1].length >= fence.len && m[2].trim() === '') {
+            fence = null;
+            continue;
+        }
+        if (fence === null) {
+            out.push(line);
+        }
+    }
+    return out.join('\n');
+}
 /** Extract tags: YAML front matter `tags:` + body `#tag`. Read-only. */
 export function extractTags(text) {
     const tags = new Set();
     // Tags are case-insensitive and never keep a leading '#': a query
     // for `project` must match `#Project` and front matter `#project`.
     const addTag = (raw) => {
-        const tag = raw.trim().replace(/^['"]|['"]$/g, '').replace(/^#+/, '').toLowerCase();
-        if (tag.length > 0) {
+        const tag = raw.trim().replace(/^['"]|['"]$/g, '').replace(/^#+/, '').trim().toLowerCase();
+        // Reject only real dirty characters (brackets, braces,
+        // quotes): a strict allowlist dropped legitimate front-matter
+        // tags with spaces or dots (`machine learning`, `node.js`,
+        // `c++`) — a 0.8.3 regression caught by Sonnet's review.
+        // Body `#tag`s are already restricted by their own regex, so
+        // this gate only affects front-matter tags. Trim again after
+        // stripping quotes/`#`: a quoted whitespace-only value
+        // (`tags: ["   "]`) would otherwise be stored as a blank tag
+        // (Carbon r2 review).
+        if (tag.length > 0 && !/[\[\]{}"]/.test(tag)) {
             tags.add(tag);
         }
     };
+    // In YAML, `#` starts a comment when it is at the start of a
+    // value or follows whitespace: `tags: # comment` is an empty
+    // value, not a tag called "comment"; `- alpha # c1` is "alpha".
+    const stripYamlComment = (value) => value.replace(/(^|\s)#.*$/, '$1').trim();
     const fm = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
     if (fm !== null) {
         const body = fm[1];
@@ -423,27 +492,55 @@ export function extractTags(text) {
         // block list as a bogus `- alpha` tag.
         const tagsLine = /^tags:[ \t]*(.*)$/m.exec(body);
         if (tagsLine !== null) {
-            const raw = tagsLine[1].trim();
-            const inline = raw.replace(/^\[|\]$/g, '');
-            for (const part of inline.split(',')) {
-                addTag(part);
+            const value = tagsLine[1].trim();
+            // Flow list `[a, #b]`: a `#` inside the brackets is a tag
+            // character, not a comment — only a `#` after the closing
+            // `]` starts a comment. Extract the bracketed list first
+            // and ignore the rest; a plain value still goes through
+            // stripYamlComment. (Stripping the comment from the whole
+            // line first ate ` #b]` and lost the tag — a 0.8.2
+            // regression.)
+            const bracket = /^\[((?:[^\]"']|"[^"]*"|'[^']*')*)\]/.exec(value);
+            if (bracket !== null) {
+                for (const part of bracket[1].split(',')) {
+                    addTag(part);
+                }
+            }
+            else if (!value.startsWith('[')) {
+                const raw = stripYamlComment(value);
+                for (const part of raw.split(',')) {
+                    addTag(part);
+                }
             }
         }
-        // Block-style list under `tags:`.
-        const block = /^tags:\s*\n((?:\s*-\s*.+\n?)+)/m.exec(body);
+        // Block-style list under `tags:`. A trailing YAML comment
+        // after `tags:` is allowed (`tags: # my tags` then `- a`).
+        const block = /^tags:[ \t]*(?:#.*)?\s*\n((?:\s*-\s*.+\n?)+)/m.exec(body);
         if (block !== null) {
             for (const line of block[1].split('\n')) {
                 const item = /^-\s*(.+?)\s*$/.exec(line.trim());
                 if (item !== null) {
-                    addTag(item[1]);
+                    addTag(stripYamlComment(item[1]));
                 }
             }
         }
     }
+    // Body `#tag`: skip fenced code blocks (a `#include` in code is
+    // not a tag) and the front-matter block (its `#` comments are
+    // YAML, not tags). A tag must contain at least one letter, so a
+    // pure number (`#123`) is not a tag. Inline code is stripped
+    // first: a `#` inside `` `git commit #amend` `` is preceded by a
+    // space, so without this it would be extracted as a tag.
+    let bodyText = text;
+    if (fm !== null) {
+        bodyText = bodyText.slice(fm[0].length);
+    }
+    bodyText = stripFencedCode(bodyText);
+    bodyText = bodyText.replace(/(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, ' ');
     // Nested tags use '/': `#a/b` is one tag, not `a`.
-    for (const match of text.matchAll(/(?:^|\s)#([\p{L}\p{N}_][\p{L}\p{N}_/-]*)/gu)) {
+    for (const match of bodyText.matchAll(/(?:^|\s)#([\p{L}\p{N}_][\p{L}\p{N}_/-]*)/gu)) {
         const tag = match[1];
-        if (tag !== undefined) {
+        if (tag !== undefined && /\p{L}/u.test(tag)) {
             addTag(tag);
         }
     }
@@ -455,20 +552,65 @@ export function extractDate(text, fileName, mtimeMs) {
     if (fm !== null) {
         const dateLine = /^date:\s*(.+?)\s*$/m.exec(fm[1]);
         if (dateLine !== null) {
-            const parsed = new Date(dateLine[1].trim());
-            if (!Number.isNaN(parsed.getTime())) {
-                return parsed.toISOString();
+            // Strip a trailing YAML comment (`date: 2026-10-28 #
+            // meeting`), otherwise the value parses as Invalid Date
+            // and the date is silently lost. Then strip surrounding
+            // quotes (`date: "2026-10-28"` is common YAML): without
+            // this the bare-date check below is bypassed and
+            // `new Date('"2026-02-31"')` silently rolls over to 2026-03-03.
+            // Any leading/trailing quote chars are stripped, paired or
+            // not: a quote is never part of a date value, and leaving
+            // one in lets V8 parse leniently and roll an invalid date
+            // over (verified: even `"2026-02-31'` rolls to 2026-03-03).
+            // Stripping is safe because the bare check below validates
+            // the components — an invalid date still falls back.
+            const raw = dateLine[1]
+                .replace(/(^|\s)#.*$/, '$1')
+                .trim()
+                .replace(/^['"]+|['"]+$/g, '');
+            // A bare date is a local calendar day, the same basis as
+            // the filename date and the date_from/date_to filters
+            // (0.8.3 #5): storing it as UTC midnight would put it on
+            // the previous local day in negative-offset timezones.
+            // It must also not roll over (`2026-02-31` -> 2026-03-03),
+            // so the parsed components must match the source.
+            const bare = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+            if (bare !== null) {
+                const y = Number(bare[1]);
+                const m = Number(bare[2]);
+                const d = Number(bare[3]);
+                const parsed = localDate(y, m, d);
+                if (parsed.getFullYear() === y &&
+                    parsed.getMonth() + 1 === m &&
+                    parsed.getDate() === d) {
+                    return parsed.toISOString();
+                }
+                // Invalid bare date: fall through to filename / mtime.
+            }
+            else {
+                const parsed = new Date(raw);
+                if (!Number.isNaN(parsed.getTime())) {
+                    return parsed.toISOString();
+                }
             }
         }
     }
-    const nameMatch = /(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2})/.exec(fileName);
+    const nameMatch = /(?<!\d)(?:(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2}))(?!\d)/.exec(fileName);
     if (nameMatch !== null) {
         const y = nameMatch[1] ?? nameMatch[4];
         const m = nameMatch[2] ?? nameMatch[5];
         const d = nameMatch[3] ?? nameMatch[6];
         if (y !== undefined && m !== undefined && d !== undefined) {
-            const parsed = new Date(`${y}-${m}-${d}T00:00:00.000Z`);
-            if (!Number.isNaN(parsed.getTime())) {
+            // A date that does not exist must not silently roll over:
+            // `new Date(2026, 1, 31)` becomes 2026-03-03 instead of
+            // failing, so the parsed components must match the source.
+            // Local calendar day (same basis as the filters): a file
+            // named 2026-10-28 belongs to the local 2026-10-28.
+            const parsed = localDate(Number(y), Number(m), Number(d));
+            if (!Number.isNaN(parsed.getTime()) &&
+                parsed.getFullYear() === Number(y) &&
+                parsed.getMonth() + 1 === Number(m) &&
+                parsed.getDate() === Number(d)) {
                 return parsed.toISOString();
             }
         }
@@ -583,6 +725,24 @@ export class LocalSearchIndex {
     distrustDisk = false;
     /** Next chunk id to hand out; only grows, never reused after a removal. */
     nextChunkIdValue = 0;
+    /**
+     * Random token written into the lock file when this process takes
+     * it (see acquireLock). releaseLock only deletes the lock when
+     * the file still carries our token — an old process that wakes up
+     * after its lock was stolen must not delete the new owner's lock.
+     */
+    lockToken = null;
+    /** Interval that renews the lock timestamp while we hold it (heartbeat). */
+    lockHeartbeat = null;
+    /**
+     * When resolveNoteImageRef last waited for another process's
+     * build to finish (see the cold-start wait there). A note with
+     * many Obsidian images calls it once per image; without this,
+     * each image would wait the full ~2 s again when the other
+     * process's build runs long, so one read_file could block 20 s
+     * instead of ~2 s.
+     */
+    lastColdWaitMs = 0;
     /**
      * Chunk-entry count per term, so dropping a file can tell whether
      * a term's postings map is empty in O(1). (Counting keys with
@@ -1269,14 +1429,64 @@ export class LocalSearchIndex {
      * on-disk index is safe to load and the lock is stealable.
      */
     async isLockHeldByLiveProcess() {
+        let raw;
         try {
-            const raw = await fs.readFile(this.lockPath, 'utf8');
+            raw = await fs.readFile(this.lockPath, 'utf8');
+        }
+        catch {
+            return false; // No lock file.
+        }
+        try {
             const prev = JSON.parse(raw);
             return (typeof prev.time === 'number' &&
                 Date.now() - prev.time <= INDEX_LOCK_TIMEOUT_MS);
         }
         catch {
-            // No lock file, or unreadable: treat as not held.
+            // Unreadable (empty or half-written): the owner just created
+            // the lock and is still writing the stamp. It counts as held
+            // when the file itself is fresh — same mtime rule as
+            // isLockStealable, or a just-started build is not deferred to.
+            try {
+                const st = await fs.stat(this.lockPath);
+                return Date.now() - st.mtimeMs <= INDEX_LOCK_TIMEOUT_MS;
+            }
+            catch {
+                return false;
+            }
+        }
+    }
+    /**
+     * True when the lock file is present and provably stale (its
+     * owner is gone), so it may be stolen. A fresh lock is not
+     * stealable. An unreadable lock is not stealable either, unless
+     * the file itself is old: a lock whose owner just created it is
+     * an empty file until the stamp lands, and treating that empty
+     * file as "corrupt, delete it" lets two processes hold the lock
+     * at once (the 0.8.3 acquire-side race).
+     */
+    async isLockStealable() {
+        let raw;
+        try {
+            raw = await fs.readFile(this.lockPath, 'utf8');
+        }
+        catch {
+            return false; // No lock file: nothing to steal.
+        }
+        try {
+            const prev = JSON.parse(raw);
+            if (typeof prev.time === 'number') {
+                return Date.now() - prev.time > INDEX_LOCK_TIMEOUT_MS;
+            }
+            // No usable timestamp: fall back to the file's mtime.
+        }
+        catch {
+            // Unparseable (empty or half-written): fall back to mtime.
+        }
+        try {
+            const st = await fs.stat(this.lockPath);
+            return Date.now() - st.mtimeMs > INDEX_LOCK_TIMEOUT_MS;
+        }
+        catch {
             return false;
         }
     }
@@ -1290,7 +1500,12 @@ export class LocalSearchIndex {
         catch {
             return false;
         }
-        const stamp = JSON.stringify({ pid: process.pid, time: Date.now() });
+        // A random token identifies OUR lock: an old process that wakes
+        // up after its lock was stolen must not delete the new owner's
+        // lock in releaseLock. The token is written into the lock file
+        // and kept on the instance for the ownership check.
+        const token = crypto.randomBytes(16).toString('hex');
+        const stamp = JSON.stringify({ pid: process.pid, time: Date.now(), token });
         for (let attempt = 0; attempt < 3; attempt += 1) {
             try {
                 const handle = await fs.open(this.lockPath, 'wx');
@@ -1300,28 +1515,28 @@ export class LocalSearchIndex {
                 finally {
                     await handle.close();
                 }
+                this.lockToken = token;
+                this.startLockHeartbeat();
                 return true;
             }
             catch (error) {
                 if (error.code !== 'EEXIST') {
                     return false;
                 }
-                try {
-                    const raw = await fs.readFile(this.lockPath, 'utf8');
-                    const prev = JSON.parse(raw);
-                    if (typeof prev.time === 'number' &&
-                        Date.now() - prev.time > INDEX_LOCK_TIMEOUT_MS) {
-                        await fs.unlink(this.lockPath);
-                        continue;
-                    }
-                }
-                catch {
-                    // Unreadable lock: treat as stale and retry once.
-                    try {
-                        await fs.unlink(this.lockPath);
-                    }
-                    catch {
-                        return false;
+                // Another process holds the lock, or is in the middle of
+                // creating it. Steal it only when it is provably stale.
+                if (await this.isLockStealable()) {
+                    // Re-check immediately before unlinking: another
+                    // process may have taken the lock over since the first
+                    // read, and unlinking then would delete the new
+                    // owner's lock (the steal-side TOCTOU).
+                    if (await this.isLockStealable()) {
+                        try {
+                            await fs.unlink(this.lockPath);
+                        }
+                        catch {
+                            // Someone else removed it first: retry the create.
+                        }
                     }
                     continue;
                 }
@@ -1333,12 +1548,80 @@ export class LocalSearchIndex {
         }
         return false;
     }
+    /**
+     * Release the lock — but only when it is still ours. An old
+     * process that wakes up after its lock was stolen (30 s timeout,
+     * another process took over) must not delete the new owner's
+     * lock: the unconditional unlink here was the 0.8.2 lock race.
+     */
     async releaseLock() {
+        this.stopLockHeartbeat();
+        if (this.lockToken === null) {
+            return;
+        }
+        const token = this.lockToken;
+        this.lockToken = null;
         try {
+            const raw = await fs.readFile(this.lockPath, 'utf8');
+            const prev = JSON.parse(raw);
+            if (prev.token !== token) {
+                // Stolen (or already replaced): it is someone else's lock now.
+                return;
+            }
             await fs.unlink(this.lockPath);
         }
         catch {
-            // Lock already gone (stolen as stale): nothing to do.
+            // Lock already gone (stolen as stale, then released): nothing to do.
+        }
+    }
+    /**
+     * Renew the lock timestamp while we hold it, so a build running
+     * longer than the 30 s staleness timeout cannot have its lock
+     * stolen by another process. Fires every 10 s (a third of the
+     * timeout); each tick rewrites the lock file with a fresh time
+     * only when it still carries our token, and stops itself when
+     * the lock is no longer ours.
+     */
+    startLockHeartbeat() {
+        this.stopLockHeartbeat();
+        this.lockHeartbeat = setInterval(() => {
+            void (async () => {
+                if (this.lockToken === null) {
+                    this.stopLockHeartbeat();
+                    return;
+                }
+                const token = this.lockToken;
+                try {
+                    const raw = await fs.readFile(this.lockPath, 'utf8');
+                    const prev = JSON.parse(raw);
+                    if (prev.token !== token) {
+                        // Stolen: stop renewing a lock that is no longer ours.
+                        this.stopLockHeartbeat();
+                        return;
+                    }
+                    const stamp = JSON.stringify({
+                        pid: prev.pid ?? process.pid,
+                        time: Date.now(),
+                        token,
+                    });
+                    // Atomic (temp file + rename): a plain writeFile
+                    // truncates first, and a reader in that window sees an
+                    // empty / half-written lock and may delete it as "stale".
+                    await atomicWrite(this.lockPath, stamp, {});
+                }
+                catch {
+                    // Lock gone or unreadable: stop renewing.
+                    this.stopLockHeartbeat();
+                }
+            })();
+        }, 10_000);
+        // A heartbeat must never keep the process alive on its own.
+        this.lockHeartbeat.unref();
+    }
+    stopLockHeartbeat() {
+        if (this.lockHeartbeat !== null) {
+            clearInterval(this.lockHeartbeat);
+            this.lockHeartbeat = null;
         }
     }
     /** Ranked search over the index. Returns ready:false when the index is not built yet. */
@@ -1737,7 +2020,10 @@ export class LocalSearchIndex {
                 }
                 hash = sha256Hex(data);
             }
-            else if (hash === null) {
+            else if (hash === null && !file.nameOnly) {
+                // Filename-only files (.json/.csv/.log) are data, not notes:
+                // reading them just to hash for duplicates wastes I/O and
+                // reports noise, so they are skipped here (0.8.2 #11).
                 try {
                     data = await this.backend.readFile(file.relPath);
                 }
@@ -1746,7 +2032,7 @@ export class LocalSearchIndex {
                 }
                 hash = sha256Hex(data);
             }
-            if (hash !== null) {
+            if (hash !== null && !file.nameOnly) {
                 const group = byHash.get(hash) ?? [];
                 group.push(file.relPath);
                 byHash.set(hash, group);
@@ -1816,7 +2102,13 @@ export class LocalSearchIndex {
      * notes/deep/attachments/pic.png.
      */
     async resolveImageRef(noteRelPath, ref, imageByName) {
-        const src = ref.src.split(path.sep).join('/');
+        // Normalize backslashes too, not just `path.sep`: a note
+        // synced from Windows carries `folder\pic.png`, and on
+        // macOS/Linux `path.sep` is `/`, so `split(path.sep)` would
+        // leave the `\` intact and `path.posix.normalize` would not
+        // recognize `..\` — the escape check below would be bypassed
+        // and a legitimate Windows ref would fail to resolve.
+        const src = ref.src.replace(/\\/g, '/');
         if (ref.kind === 'obsidian' && !src.includes('/')) {
             const candidates = imageByName.get(src) ?? [];
             if (candidates.length === 1) {
@@ -1830,12 +2122,22 @@ export class LocalSearchIndex {
         if (ref.kind === 'obsidian') {
             // Vault-root-relative first (a leading `/` is Obsidian's
             // absolute-in-vault form, so it is stripped, not kept).
-            const vaultPath = src.replace(/^\/+/, '');
+            const vaultPath = path.posix.normalize(src.replace(/^\/+/, ''));
+            // A ref that escapes the library (`![[../../outside.png]]`)
+            // must not be probed: it would leak whether a file exists
+            // outside the root (the content is blocked downstream, but
+            // the existence signal alone is a side channel).
+            if (vaultPath === '..' || vaultPath.startsWith('../')) {
+                return { status: 'broken' };
+            }
             if (await this.backend.exists(vaultPath)) {
                 return { status: 'ok', path: vaultPath };
             }
             // Then note-relative.
             const noteRelative = path.posix.normalize(path.posix.join(path.posix.dirname(noteRelPath), vaultPath));
+            if (noteRelative === '..' || noteRelative.startsWith('../')) {
+                return { status: 'broken' };
+            }
             if (await this.backend.exists(noteRelative)) {
                 return { status: 'ok', path: noteRelative };
             }
@@ -1857,8 +2159,120 @@ export class LocalSearchIndex {
             return { status: 'broken' };
         }
         const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(noteRelPath), src));
+        // Same escape guard as the Obsidian branch above: a ref that
+        // resolves outside the library is broken, not probed.
+        if (resolved === '..' || resolved.startsWith('../')) {
+            return { status: 'broken' };
+        }
         const exists = await this.backend.exists(resolved);
         return exists ? { status: 'ok', path: resolved } : { status: 'broken' };
+    }
+    /**
+     * Resolve one image reference from a note, the same way
+     * diagnostics does: Obsidian embeds resolve by filename across
+     * the whole library (vault-root first, then note-relative, then
+     * suffix), the rest relative to the note's directory. The
+     * basename map is built from the index's file list (no disk
+     * walk), so it only sees files the index knows. Used by read_file
+     * so `![[pic.png]]` works there too (0.8.2 #2).
+     */
+    async resolveNoteImageRef(noteRelPath, ref) {
+        // The basename map comes from the index's file list. When the
+        // index is ready, make sure it is fresh (a just-saved image
+        // is unresolvable until the next refresh) and use the full
+        // map. When it is NOT ready, do NOT await the whole build:
+        // ensureReady() blocks for the full index build (seconds on
+        // a large library, over a minute on a very large one) and a
+        // read_file would time out. Kick the build off in the
+        // background instead and resolve with what needs no index
+        // (vault-root and note-relative paths); only a basename-only
+        // ref (`![[pic.png]]`) reports 'broken' this once, and a
+        // retry after the build finds it.
+        if (this.status !== 'ready') {
+            // If ANOTHER process is still building (it holds the lock
+            // and the on-disk index is not out yet), the list is still
+            // empty. Wait briefly for that build to finish and retry
+            // once (bounded: ~2 s, then the refs fail as before — a
+            // retry will see them). Without this, a read_file in the
+            // multi-process cold-start window reports every Obsidian
+            // embed as missing. The wait runs at most once per 5 s: a
+            // note with many images calls this once per image, and each
+            // would otherwise wait the full ~2 s again. Only a FOREIGN
+            // lock waits: when WE hold the lock (this.lockToken !==
+            // null, our own background build) there is nothing to wait
+            // for — waiting for our own build is the cold-start block
+            // this fix removes.
+            try {
+                if (this.lockToken === null &&
+                    Date.now() - this.lastColdWaitMs >= 5_000 &&
+                    (await this.isLockHeldByLiveProcess())) {
+                    this.lastColdWaitMs = Date.now();
+                    for (let i = 0; i < 10; i += 1) {
+                        await new Promise((resolve) => {
+                            setTimeout(resolve, 200);
+                        });
+                        if (!(await this.isLockHeldByLiveProcess())) {
+                            break;
+                        }
+                    }
+                    await this.load().catch(() => undefined);
+                    void this.refreshIfNeeded(Date.now(), { background: true }).catch(() => undefined);
+                }
+            }
+            catch {
+                // Best effort only; fall through with the stale/empty list.
+            }
+            // Fast disk load first: if a valid index already exists on
+            // disk, loading it is quick (tens of ms for a small library)
+            // and this call can use the full map. Without this, the
+            // fire-and-forget ensureReady() below leaves status
+            // 'unbuilt' at the map check (its internal load() is async
+            // file I/O), so even a perfectly good on-disk index is
+            // ignored on the first read after startup — the first
+            // basename ref in the note reports 'broken' while later
+            // ones (after the background load lands) succeed. Only
+            // attempt the load when no build is already in flight and
+            // the disk copy is trusted; otherwise fall through to the
+            // background build + empty map below.
+            if (!this.distrustDisk &&
+                this.status === 'unbuilt' &&
+                this.buildPromise === null) {
+                await this.load().catch(() => undefined);
+            }
+        }
+        // Use the index if it is ready now (either it was already, or
+        // the fast disk load / foreign build above made it so);
+        // otherwise kick the build off in the background and resolve
+        // without the index.
+        if (this.status === 'ready') {
+            if (this.needsRefresh) {
+                await this.refreshIfNeeded().catch(() => undefined);
+            }
+            else {
+                void this.refreshIfNeeded(Date.now(), { background: true }).catch(() => undefined);
+            }
+        }
+        else {
+            void this.ensureReady().catch(() => undefined);
+        }
+        // Only build the basename map when the index is ready. On a
+        // cold start it stays empty: resolveImageRef still resolves
+        // vault-root and note-relative paths, and only basename-only
+        // refs report 'broken' until the background build finishes.
+        const imageByName = new Map();
+        if (this.status === 'ready') {
+            for (const relPath of this.data.fileNames) {
+                const ext = path.extname(relPath).toLowerCase();
+                if (!IMAGE_EXTENSIONS.has(ext)) {
+                    continue;
+                }
+                const base = path.basename(relPath);
+                const list = imageByName.get(base) ?? [];
+                list.push(relPath);
+                imageByName.set(base, list);
+            }
+        }
+        return this.resolveImageRef(noteRelPath, ref, imageByName);
     }
     /** Walk every file (any type) for orphan detection. Same symlink guards as the text walk: no escapes, no loops. */
     async walkAllFiles() {

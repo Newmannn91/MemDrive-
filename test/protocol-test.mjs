@@ -35,6 +35,7 @@ import {
   writeHostConfig,
 } from '../dist/host-config.js';
 import { atomicWrite } from '../dist/atomic.js';
+import { readClipboardImage } from '../dist/clipboard.js';
 import { acquireImage, detectImageMime, encodeImageSrc, extensionForMime, mimeFromExtension, scanMarkdownImages } from '../dist/images.js';
 import { BlockedUrlError, safeRequest } from '../dist/net-guard.js';
 import { LocalStorageBackend } from '../dist/storage.js';
@@ -48,6 +49,7 @@ import {
   highlightSnippet,
   isPlaceholderFile,
   normalizeText,
+  parseDateBound,
   reciprocalRankFusion,
   tokenize,
   tokenizeQuery,
@@ -872,6 +874,47 @@ async function main() {
       assert.ok(decoded.equals(smallPng), 'under-cap image must pass through byte-identical');
     });
 
+    await check('0.8.3 read_file: Obsidian embeds resolve across the library; .markdown treated as Markdown', async () => {
+      await fs.mkdir(path.join(root, 'attachments'), { recursive: true });
+      await fs.writeFile(path.join(root, 'attachments', 'pic.png'), smallPng);
+      // By filename across the library (no slash) and by vault path.
+      const saved = await call('save_file', {
+        path: 'notes/obsidian.md',
+        content: '# Obsidian\n\n![[pic.png]]\n\n![[attachments/pic.png]]\n',
+      });
+      assert.equal(saved.isError, undefined, textOf(saved));
+      // Force the index refresh (save marks dirty; a search awaits it).
+      const found = await call('search_files', { keyword: 'Obsidian' });
+      assert.equal(found.isError, undefined, textOf(found));
+      const read = await call('read_file', { path: 'notes/obsidian.md' });
+      assert.equal(read.isError, undefined, textOf(read));
+      assert.doesNotMatch(textOf(read), /Skipped image/);
+      assert.equal(imagesOf(read).length, 2, 'both Obsidian embeds must resolve to images');
+      // .markdown is Markdown too: inline refs resolve.
+      const savedMd = await call('save_file', {
+        path: 'notes/md-ext.markdown',
+        content: '# MdExt\n\n![pic](../attachments/pic.png)\n',
+      });
+      assert.equal(savedMd.isError, undefined, textOf(savedMd));
+      await call('search_files', { keyword: 'MdExt' });
+      const readMd = await call('read_file', { path: 'notes/md-ext.markdown' });
+      assert.equal(readMd.isError, undefined, textOf(readMd));
+      assert.doesNotMatch(textOf(readMd), /Skipped image/);
+      assert.equal(imagesOf(readMd).length, 1, '.markdown must resolve its image refs');
+      // Round 3: an inline ref with Windows backslashes (a note
+      // synced from Windows, written directly so save_file does
+      // not encode it) resolves in read_file too — the
+      // non-Obsidian branch in tools.ts now normalizes `\`.
+      await fs.writeFile(
+        path.join(root, 'notes', 'backslash.md'),
+        '# Backslash\n\n![pic](..\\attachments\\pic.png)\n',
+      );
+      const readBs = await call('read_file', { path: 'notes/backslash.md' });
+      assert.equal(readBs.isError, undefined, textOf(readBs));
+      assert.doesNotMatch(textOf(readBs), /Skipped image/);
+      assert.equal(imagesOf(readBs).length, 1, 'an inline backslash ref must resolve in read_file');
+    });
+
     await check('read_file of a bare image path returns one image block', async () => {
       const res = await call('read_file', { path: 'notes/assets/' + (await fs.readdir(path.join(root, 'notes/assets')))[0] });
       assert.equal(res.isError, undefined, textOf(res));
@@ -1023,6 +1066,53 @@ async function main() {
       // Server must still answer after the clipboard attempt.
       const alive = await call('list_directory', { path: 'notes' });
       assert.equal(alive.isError, undefined);
+    });
+
+    await check('Sonnet 0.8.3 clipboard: stderr separates empty from no session', async () => {
+      // Fake xclip/wl-paste scripts only exist on the Linux path:
+      // readClipboardImage dispatches by platform (Windows uses
+      // PowerShell, macOS its own reader), so on Windows/macOS
+      // these assertions would fail for real-clipboard reasons.
+      // Skip there (Sonnet FIXED2 review); the guard needs no
+      // re-review.
+      if (process.platform !== 'linux') return;
+      // xclip exits 1 in BOTH cases, so the exit code cannot tell
+      // them apart — only the stderr text can. Fake xclip scripts
+      // on PATH simulate each case (Sonnet's real Xvfb finding).
+      const binDir = path.join(scratch, 'fake-clip-bin');
+      await fs.mkdir(binDir, { recursive: true });
+      const origPath = process.env.PATH ?? '';
+      const writeFake = async (name, stderr, code) => {
+        const p = path.join(binDir, name);
+        await fs.writeFile(p, `#!/bin/sh\necho ${JSON.stringify(stderr)} >&2\nexit ${code}\n`);
+        await fs.chmod(p, 0o755);
+      };
+      try {
+        // Real X session, empty clipboard: xclip exits 1 with
+        // "target STRING not available" — must be 'empty'.
+        await writeFake('xclip', 'Error: target STRING not available', 1);
+        process.env.PATH = `${binDir}${path.delimiter}${origPath}`;
+        assert.equal((await readClipboardImage()).kind, 'empty');
+        // No display: xclip exits 1 with "Can't open display" —
+        // must be 'unsupported'.
+        await writeFake('xclip', "Error: Can't open display", 1);
+        assert.equal((await readClipboardImage()).kind, 'unsupported');
+        // wl-paste, empty clipboard: "Nothing is copied" — 'empty'.
+        await writeFake('wl-paste', 'Nothing is copied', 1);
+        await writeFake('xclip', "Error: Can't open display", 1);
+        assert.equal((await readClipboardImage()).kind, 'empty');
+        // wl-paste, no session: "Failed to connect to a Wayland
+        // server" — 'unsupported' (xclip also has no display).
+        await writeFake('wl-paste', 'Failed to connect to a Wayland server', 1);
+        assert.equal((await readClipboardImage()).kind, 'unsupported');
+        // Argon round 5: wl-paste with content in another format
+        // ("No suitable type of content copied") — nothing usable
+        // to capture, so 'empty', not 'unsupported'.
+        await writeFake('wl-paste', 'No suitable type of content copied', 1);
+        assert.equal((await readClipboardImage()).kind, 'empty');
+      } finally {
+        process.env.PATH = origPath;
+      }
     });
 
     await check('save_file with failing image still saves text (graceful degradation)', async () => {
@@ -1315,7 +1405,15 @@ async function main() {
       smallTransport = new StdioClientTransport({
         command: process.execPath,
         args: [SERVER],
-        env: { ...process.env, MEMDRIVE_ROOT: root, MEMDRIVE_RESPONSE_BUDGET_BYTES: '200000' },
+        env: {
+          ...process.env,
+          MEMDRIVE_ROOT: root,
+          MEMDRIVE_RESPONSE_BUDGET_BYTES: '200000',
+          // Without this the small-budget server falls back to the
+          // default cache location (hashed by library path) and
+          // leaves an orphan hash folder behind after every run.
+          MEMDRIVE_CACHE_DIR: path.join(scratch, 'index-cache-small'),
+        },
         stderr: 'pipe',
       });
       smallClient = new Client(
@@ -2113,9 +2211,175 @@ async function main() {
         extractTags('正文 #Project #a/b #Work\n').sort(),
         ['project', 'a/b', 'work'].sort(),
       );
-      assert.equal(extractDate('x', '2026-11-08-note.md', 0), '2026-11-08T00:00:00.000Z');
-      assert.equal(extractDate('---\ndate: 2025-01-02\n---\n', 'note.md', 0), '2025-01-02T00:00:00.000Z');
+      // Dates are local calendar days (0.8.3 #5/#6): compare
+      // against the local-midnight value, whatever the TZ is.
+      assert.equal(extractDate('x', '2026-11-08-note.md', 0), new Date(2026, 10, 8).toISOString());
+      assert.equal(extractDate('---\ndate: 2025-01-02\n---\n', 'note.md', 0), new Date(2025, 0, 2).toISOString());
       assert.equal(extractDate('x', 'note.md', 0), new Date(0).toISOString());
+    });
+
+    await check('0.8.3 dates/tags: invalid dates do not roll over; YAML comments and code are not tags', async () => {
+      // #4: a date that does not exist falls back to mtime instead
+      // of rolling over (Feb 31 -> Mar 3).
+      assert.equal(extractDate('x', '20260231.md', 0), new Date(0).toISOString());
+      assert.equal(extractDate('x', '2026-02-31-x.md', 0), new Date(0).toISOString());
+      // #4: a longer digit run is not a date (13 digits).
+      assert.equal(extractDate('x', 'order-20261108123.md', 0), new Date(0).toISOString());
+      // A real date still parses (local calendar day, same basis
+      // as the filters).
+      assert.equal(extractDate('x', '20261108.md', 0), new Date(2026, 10, 8).toISOString());
+      // #4 (front matter): a bare date that does not exist falls
+      // back instead of rolling over, and a trailing YAML comment
+      // is stripped before parsing.
+      assert.equal(extractDate('---\ndate: 2026-02-31\n---\n', 'note.md', 0), new Date(0).toISOString());
+      assert.equal(
+        extractDate('---\ndate: 2026-10-28 # 会议\n---\n', 'note.md', 0),
+        new Date(2026, 9, 28).toISOString(),
+      );
+      // Round 2: a quoted YAML date (`date: "2026-02-31"`) must
+      // not bypass the rollover check — V8 parses the quoted
+      // string and rolls it to 2026-03-03.
+      assert.equal(extractDate('---\ndate: "2026-02-31"\n---\n', 'note.md', 0), new Date(0).toISOString());
+      assert.equal(
+        extractDate('---\ndate: "2026-10-28"\n---\n', 'note.md', 0),
+        new Date(2026, 9, 28).toISOString(),
+      );
+      // Round 3: V8 parses even unpaired quotes leniently and
+      // rolls over, so any leading/trailing quote chars are
+      // stripped (the bare check below still validates the date).
+      assert.equal(extractDate('---\ndate: "2026-02-31\'\n---\n', 'note.md', 0), new Date(0).toISOString());
+      assert.equal(
+        extractDate('---\ndate: "2026-10-28\'\n---\n', 'note.md', 0),
+        new Date(2026, 9, 28).toISOString(),
+      );
+      // Round 2: years 0-99 (`new Date(50, ...)` becomes 1950)
+      // are set with setFullYear, so they parse instead of
+      // falling back to mtime.
+      {
+        const y50 = new Date(0);
+        y50.setFullYear(50, 0, 1);
+        y50.setHours(0, 0, 0, 0);
+        assert.equal(extractDate('x', '0050-01-01-note.md', 0), y50.toISOString());
+      }
+      // #5: a date-only bound is that calendar day in local time,
+      // not UTC midnight (timezone-independent assertion: compare
+      // against the local-midnight value, whatever the TZ is).
+      assert.equal(parseDateBound('2026-10-28', false), new Date(2026, 9, 28).getTime());
+      assert.equal(parseDateBound('2026-10-28', true), new Date(2026, 9, 28, 23, 59, 59, 999).getTime());
+      assert.throws(() => parseDateBound('2026-02-31', false), /Invalid date/);
+      // #10: a YAML trailing `#` comment is not a tag.
+      assert.deepEqual(
+        extractTags('---\ntags: # comment\n---\nbody\n').sort(),
+        [].sort(),
+      );
+      assert.deepEqual(
+        extractTags('---\ntags:\n  - alpha # c1\n  - beta\n---\nbody\n').sort(),
+        ['alpha', 'beta'].sort(),
+      );
+      // #10: fenced code and pure numbers are not tags. `#fff` in
+      // prose still counts (it has letters); inside a code block it
+      // does not.
+      assert.deepEqual(
+        extractTags('#real\n```\n#include <stdio.h>\ncolor: #fff;\n```\n#123\n').sort(),
+        ['real'].sort(),
+      );
+      assert.deepEqual(
+        extractTags('#real #fff #123\n').sort(),
+        ['real', 'fff'].sort(),
+      );
+      // Inline code is stripped before the tag scan: a `#` with
+      // a space before it inside backticks (`` `git commit
+      // #amend` ``) is not a tag, and neither is one with no
+      // space before it.
+      assert.deepEqual(
+        extractTags('run `git commit #amend` then #done\n').sort(),
+        ['done'].sort(),
+      );
+      assert.deepEqual(
+        extractTags('text `#not-a-tag` and #yes\n').sort(),
+        ['yes'].sort(),
+      );
+      // CRLF: a fenced block whose lines end `\r\n` is still
+      // stripped, so `#include` inside it is not a tag.
+      assert.deepEqual(
+        extractTags('#real\r\n```\r\n#include <stdio.h>\r\n```\r\n#done\r\n').sort(),
+        ['real', 'done'].sort(),
+      );
+      // A comment after `tags:` does not eat the block list.
+      assert.deepEqual(
+        extractTags('---\ntags: # my tags\n  - alpha\n  - beta\n---\nbody\n').sort(),
+        ['alpha', 'beta'].sort(),
+      );
+    });
+
+    await check('Sonnet 0.8.3 tags: flow-list # tags, indented and unclosed fences', async () => {
+      // A `#` inside a flow list `[#a, #b]` is a tag character,
+      // not a comment: both tags survive (0.8.2 got both; the
+      // whole-line stripYamlComment ate ` #b]` — a regression).
+      assert.deepEqual(
+        extractTags('---\ntags: [#a, #b]\n---\nbody\n').sort(),
+        ['a', 'b'].sort(),
+      );
+      // A comment after the closing `]` is still a comment.
+      assert.deepEqual(
+        extractTags('---\ntags: [#a, #b] # my tags\n---\nbody\n').sort(),
+        ['a', 'b'].sort(),
+      );
+      // Sonnet final review: the addTag allowlist dropped
+      // legitimate front-matter tags with spaces or dots
+      // (`machine learning`, `node.js`, `c++`) — only real dirty
+      // characters (brackets, braces, quotes) are rejected now.
+      assert.deepEqual(
+        extractTags('---\ntags: [node.js, c++, machine learning]\n---\nbody\n').sort(),
+        ['node.js', 'c++', 'machine learning'].sort(),
+      );
+      assert.deepEqual(
+        extractTags('---\ntags: ["a]b", c]\n---\nbody\n').sort(),
+        ['c'].sort(),
+      );
+      assert.deepEqual(
+        extractTags('---\ntags:\n  - machine learning\n  - node.js\n  - 2026\n---\nbody\n').sort(),
+        ['machine learning', 'node.js', '2026'].sort(),
+      );
+      // Carbon r2 review: Sonnet's exact table case, with `c#`.
+      assert.deepEqual(
+        extractTags('---\ntags: [node.js, c++, c#, machine learning]\n---\nbody\n').sort(),
+        ['node.js', 'c++', 'c#', 'machine learning'].sort(),
+      );
+      // A plain value with spaces is one tag (Sonnet: old version
+      // extracted it as a single tag, and this version keeps it).
+      assert.deepEqual(
+        extractTags('---\ntags: alpha beta gamma\n---\nbody\n').sort(),
+        ['alpha beta gamma'].sort(),
+      );
+      // Quoted whitespace-only values are not tags: stripping the
+      // quotes/`#` must not leave a blank tag in the index.
+      assert.deepEqual(
+        extractTags('---\ntags: ["   "]\n---\nbody\n').sort(),
+        [].sort(),
+      );
+      assert.deepEqual(
+        extractTags('---\ntags: ["  ", "#  "]\n---\nbody\n').sort(),
+        [].sort(),
+      );
+      // A fence indented up to 3 spaces (e.g. under a list item)
+      // is still a fence, so `#include` inside it is not a tag.
+      assert.deepEqual(
+        extractTags('#real\n- item\n  ```\n  #include <stdio.h>\n  ```\n#done\n').sort(),
+        ['real', 'done'].sort(),
+      );
+      // A fence indented 4 spaces is an indented code block, not
+      // a fence, so its content is scanned (CommonMark).
+      assert.deepEqual(
+        extractTags('#real\n    ```\n    #include <stdio.h>\n    ```\n').sort(),
+        ['real', 'include'].sort(),
+      );
+      // An unclosed fence swallows the rest of the note, so a
+      // `#tag` after it is not extracted.
+      assert.deepEqual(
+        extractTags('#real\n```js\nconst x = 1; // #include\n#after\n').sort(),
+        ['real'].sort(),
+      );
     });
 
     await check('0.8.0 BM25 + RRF: scores sane, phrase-free ranking fuses', async () => {
@@ -2276,15 +2540,29 @@ async function main() {
       process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-incr-cache');
       const backend = new LocalStorageBackend(libDir);
       const idx = new LocalSearchIndex(libDir, libDir, backend);
-      await fs.writeFile(path.join(libDir, 'one.md'), '# One\n\n苹果香蕉。\n');
+      // 0.8.3 hardening (CI #10 flake, 1/100): the refresh classifies
+      // by mtime+size, and two writes landing in the same
+      // millisecond with the same byte size are indistinguishable by
+      // stat alone. Give every write a distinct mtime (seconds
+      // apart) so the test verifies the refresh logic, not the
+      // filesystem's timestamp granularity.
+      let mtimeSeq = Date.now();
+      const writeDated = async (rel, content) => {
+        const abs = path.join(libDir, rel);
+        await fs.writeFile(abs, content);
+        mtimeSeq += 2000;
+        const stamp = new Date(mtimeSeq);
+        await fs.utimes(abs, stamp, stamp);
+      };
+      await writeDated('one.md', '# One\n\n苹果香蕉。\n');
       await idx.buildAll();
       assert.equal((await idx.search({ keyword: '苹果' })).total, 1);
       // Add a file: refresh (forced past the throttle) finds it.
-      await fs.writeFile(path.join(libDir, 'two.md'), '# Two\n\n苹果橙子。\n');
+      await writeDated('two.md', '# Two\n\n苹果橙子。\n');
       await idx.refreshIfNeeded(Date.now() + 60_000);
       assert.equal((await idx.search({ keyword: '苹果' })).total, 2);
       // Change a file: new content found, old content gone.
-      await fs.writeFile(path.join(libDir, 'one.md'), '# One\n\n葡萄西瓜。\n');
+      await writeDated('one.md', '# One\n\n葡萄西瓜。\n');
       await idx.refreshIfNeeded(Date.now() + 120_000);
       assert.equal((await idx.search({ keyword: '苹果' })).total, 1);
       assert.equal((await idx.search({ keyword: '葡萄' })).total, 1);
@@ -2293,7 +2571,7 @@ async function main() {
       await idx.refreshIfNeeded(Date.now() + 180_000);
       assert.equal((await idx.search({ keyword: '苹果' })).total, 0);
       // Placeholder file is never indexed.
-      await fs.writeFile(path.join(libDir, 'cloud.md.icloud'), '苹果占位符。\n');
+      await writeDated('cloud.md.icloud', '苹果占位符。\n');
       await idx.refreshIfNeeded(Date.now() + 240_000);
       assert.equal((await idx.search({ keyword: '占位符' })).total, 0);
       // Persist + reload keeps the index.
@@ -2647,6 +2925,98 @@ async function main() {
       await idx3.load();
       assert.equal(idx3.getStatus(), 'ready');
       assert.ok((await idx3.search({ keyword: '全文检索' })).hits.some((h) => h.path === 'a.md'));
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.3 lock: a stolen lock is not deleted by the old owner on release', async () => {
+      const libDir = path.join(scratch, 'index-locktoken-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      const cacheDir = path.join(scratch, 'index-locktoken-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      // Enough files that the build is still running when the lock
+      // is stolen below (the build yields between files).
+      for (let i = 0; i < 300; i += 1) {
+        await fs.writeFile(path.join(libDir, `n${i}.md`), `# N${i}\n\n锁令牌测试。\n`);
+      }
+      const idx = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      const lockPath = path.join(idx.getCacheDir(), 'index.lock');
+      let buildDone = false;
+      const buildPromise = idx.buildAll().then((r) => {
+        buildDone = true;
+        return r;
+      });
+      // Wait until this process has taken the lock, then steal it
+      // (replace the file with a foreign token, as a second process
+      // would after the 30 s timeout).
+      for (let i = 0; i < 200; i += 1) {
+        try {
+          await fs.access(lockPath);
+          break;
+        } catch {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      }
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ pid: 99999, time: Date.now(), token: 'foreign-token' }),
+      );
+      assert.equal(buildDone, false, 'the build must still be running when the lock is stolen');
+      assert.equal(await buildPromise, 'built');
+      // The old owner's release must not delete the foreign lock.
+      const after = await fs.readFile(lockPath, 'utf8');
+      assert.match(after, /foreign-token/);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.8.3 read_file: cold index still resolves Obsidian embeds; escaping refs are broken', async () => {
+      const libDir = path.join(scratch, 'index-cold-lib');
+      await fs.mkdir(path.join(libDir, 'attachments'), { recursive: true });
+      await fs.writeFile(path.join(libDir, 'attachments', 'pic.png'), smallPng);
+      // A real file OUTSIDE the library, one level up: an escaping
+      // ref must not be able to probe it.
+      await fs.writeFile(path.join(scratch, 'outside.png'), smallPng);
+      const cacheDir = path.join(scratch, 'index-cold-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
+      const idx = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      // Cold, index not ready: a basename-only ref needs the
+      // filename map, so it reports 'broken' instead of blocking
+      // on the whole build (Sonnet: a cold read must not wait for
+      // the full index). Returning 'broken' here is the proof it
+      // did not block — had it awaited the build, it would be 'ok'.
+      const coldBase = await idx.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: 'pic.png' });
+      assert.equal(coldBase.status, 'broken', 'a cold basename ref must not block on the build');
+      // Vault-root and note-relative refs need no index, so they
+      // resolve immediately on a cold index.
+      const coldVault = await idx.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: 'attachments/pic.png' });
+      assert.equal(coldVault.status, 'ok', 'a cold vault-root ref must resolve without the index');
+      assert.equal(coldVault.path, 'attachments/pic.png');
+      // After the background build finishes, the basename ref works.
+      await idx.ensureReady();
+      const warm = await idx.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: 'pic.png' });
+      assert.equal(warm.status, 'ok', 'a basename ref must resolve once the index is ready');
+      assert.equal(warm.path, 'attachments/pic.png');
+      // Argon round 5: an index already persisted on disk must be
+      // used on the first read after a (simulated) restart — a
+      // fresh instance over the same cache dir loads it fast
+      // instead of reporting the basename ref broken.
+      const idx2 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      const restarted = await idx2.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: 'pic.png' });
+      assert.equal(restarted.status, 'ok', 'a persisted index must be loaded on the first read after restart');
+      assert.equal(restarted.path, 'attachments/pic.png');
+      // Escaping refs are broken, never probed: outside.png exists
+      // one level up, but must not be reported as found.
+      const esc = await idx.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: '../../outside.png' });
+      assert.equal(esc.status, 'broken', 'an Obsidian ref escaping the library must be broken, not probed');
+      const esc2 = await idx.resolveNoteImageRef('notes.md', { kind: 'inline', src: '../../outside.png' });
+      assert.equal(esc2.status, 'broken', 'an inline ref escaping the library must be broken, not probed');
+      // Round 2: backslashes (a note synced from Windows) are
+      // normalized on every platform, so `folder\pic.png` resolves
+      // on macOS/Linux and `..\..\outside.png` is still caught.
+      const bs = await idx.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: 'attachments\\pic.png' });
+      assert.equal(bs.status, 'ok', 'a Windows-style backslash ref must resolve');
+      assert.equal(bs.path, 'attachments/pic.png');
+      const bsEsc = await idx.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: '..\\..\\outside.png' });
+      assert.equal(bsEsc.status, 'broken', 'a backslash escape must be caught, not probed');
       delete process.env['MEMDRIVE_CACHE_DIR'];
     });
 

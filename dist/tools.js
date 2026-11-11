@@ -18,7 +18,7 @@ import { IMAGE_PREVIEW_MAX_BYTES, READ_MAX_IMAGES, SAVE_IMAGES_MAX_DOWNLOAD_BYTE
 import { MemDriveError, NotFoundError } from './errors.js';
 import { acquireImage, base64Length, detectImageMime, encodeImageSrc, extensionForMime, makePreview, maxBinaryForBase64Budget, mimeFromExtension, scanMarkdownImages, } from './images.js';
 import { assertInsideRealRoot, isInside, sandboxPath, sandboxPathForWrite, toDisplayPath, } from './sandbox.js';
-import { LocalSearchIndex, } from './search-index.js';
+import { LocalSearchIndex, MARKDOWN_EXTENSIONS, } from './search-index.js';
 import { openFolderInViewer, openInViewer } from './viewer.js';
 function textBlock(text) {
     return { type: 'text', text };
@@ -448,10 +448,10 @@ async function handleSaveFile(ctx, inputPath, content, mode, imageSpecs) {
         }
     }
     // 3. Build the document body. Markdown references are appended only for
-    //    .md documents; other formats keep their images in assets/ and the
+    //    Markdown documents; other formats keep their images in assets/ and the
     //    result text reports their paths.
     let body = content;
-    if (savedImages.length > 0 && docExt === '.md') {
+    if (savedImages.length > 0 && MARKDOWN_EXTENSIONS.has(docExt)) {
         const refs = savedImages
             .map((img) => `\n![${img.alt}](assets/${encodeImageSrc(img.fileName)})`)
             .join('');
@@ -469,7 +469,7 @@ async function handleSaveFile(ctx, inputPath, content, mode, imageSpecs) {
         ];
         if (savedImages.length > 0) {
             lines.push(`Images stored in assets/: ${savedImages.map((i) => i.fileName).join(', ')}.`);
-            if (docExt !== '.md') {
+            if (!MARKDOWN_EXTENSIONS.has(docExt)) {
                 lines.push('No image references were appended because the file is not Markdown; the image paths above are the references to use.');
             }
         }
@@ -489,6 +489,38 @@ async function handleSaveFile(ctx, inputPath, content, mode, imageSpecs) {
         }
         throw error;
     }
+}
+/**
+ * Resolve an image reference to an absolute on-disk path. Obsidian
+ * embeds (`![[pic.png]]`) resolve by filename across the whole
+ * library via the index (vault-root first, then note-relative, then
+ * suffix); the rest resolve relative to the note's directory, as
+ * before. Returns the absolute path, or a human-readable reason
+ * when the reference cannot be resolved.
+ */
+async function resolveImageAbs(ctx, noteRel, noteAbs, ref) {
+    if (ref.kind === 'obsidian') {
+        const resolved = await ctx.searchIndex.resolveNoteImageRef(noteRel, ref);
+        if (resolved.status === 'ok') {
+            return { abs: path.resolve(ctx.rootDir, ...resolved.path.split('/')) };
+        }
+        if (resolved.status === 'ambiguous') {
+            return { reason: `matches several files: ${resolved.candidates.join(', ')}` };
+        }
+        return { reason: 'not found in the library' };
+    }
+    // Non-Obsidian refs resolve relative to the note's directory.
+    // Normalize backslashes first (same as resolveImageRef): a note
+    // synced from Windows carries `assets\pic.png`, and on
+    // macOS/Linux `path.resolve` treats `\` as an ordinary filename
+    // character, so the image would report ENOENT while diagnostics
+    // (which normalizes) calls it valid.
+    const src = ref.src.replace(/\\/g, '/');
+    return {
+        abs: path.isAbsolute(src)
+            ? path.resolve(src)
+            : path.resolve(path.dirname(noteAbs), src),
+    };
 }
 /* ------------------------------------------------------------------ */
 /* read_file                                                           */
@@ -576,7 +608,7 @@ async function handleReadFile(ctx, inputPath, includeImages) {
         notes.push(`Text truncated to the ${formatBytes(effectiveTextCap)} read cap; the file on disk is untouched.`);
         body = truncateUtf8(body, effectiveTextCap);
     }
-    if (ext === '.md') {
+    if (MARKDOWN_EXTENSIONS.has(ext)) {
         // References are scanned from the full text, not the truncated
         // body, so a reference past the truncation point is still listed
         // or attempted (and skipped with a budget note when no room
@@ -592,22 +624,26 @@ async function handleReadFile(ctx, inputPath, includeImages) {
             const listed = [];
             const seen = new Set();
             for (const ref of refs) {
-                const imageAbs = path.isAbsolute(ref.src)
-                    ? path.resolve(ref.src)
-                    : path.resolve(path.dirname(absolute), ref.src);
+                const resolved = await resolveImageAbs(ctx, rel, absolute, ref);
                 let line;
-                try {
-                    if (!isInside(ctx.rootDir, imageAbs)) {
-                        line = `- ${ref.src} (outside the library root — not readable via read_file)`;
-                    }
-                    else {
-                        await assertInsideRealRoot(ctx.rootRealDir, imageAbs);
-                        line = `- ${relOf(ctx, imageAbs)}`;
-                    }
+                if ('reason' in resolved) {
+                    line = `- ${ref.src} (${resolved.reason})`;
                 }
-                catch (error) {
-                    const message = error instanceof Error ? error.message : String(error);
-                    line = `- ${ref.src} (${message})`;
+                else {
+                    const imageAbs = resolved.abs;
+                    try {
+                        if (!isInside(ctx.rootDir, imageAbs)) {
+                            line = `- ${ref.src} (outside the library root — not readable via read_file)`;
+                        }
+                        else {
+                            await assertInsideRealRoot(ctx.rootRealDir, imageAbs);
+                            line = `- ${relOf(ctx, imageAbs)}`;
+                        }
+                    }
+                    catch (error) {
+                        const message = error instanceof Error ? error.message : String(error);
+                        line = `- ${ref.src} (${message})`;
+                    }
                 }
                 if (!seen.has(line)) {
                     seen.add(line);
@@ -635,9 +671,12 @@ async function handleReadFile(ctx, inputPath, includeImages) {
                 notes.push(`Only the first ${READ_MAX_IMAGES} referenced images were included; the document references more.`);
                 break;
             }
-            const imageAbs = path.isAbsolute(ref.src)
-                ? path.resolve(ref.src)
-                : path.resolve(path.dirname(absolute), ref.src);
+            const resolved = await resolveImageAbs(ctx, rel, absolute, ref);
+            if ('reason' in resolved) {
+                notes.push(`Skipped image ${ref.src}: ${resolved.reason}.`);
+                continue;
+            }
+            const imageAbs = resolved.abs;
             try {
                 if (!isInside(ctx.rootDir, imageAbs)) {
                     notes.push(`Skipped image outside the library root: ${ref.src}.`);
@@ -886,19 +925,19 @@ export function registerTools(server, backend, rootDir, rootRealDir, searchIndex
             date_from: z
                 .string()
                 .optional()
-                .describe('Earliest file date (ISO date, e.g. "2026-01-01"). File date is front matter date, then filename date, then modification time.'),
+                .describe('Earliest file date (ISO date, e.g. "2026-01-01"). File date is front matter date, then filename date, then modification time. A date-only value means that calendar day in the server\'s local timezone.'),
             date_to: z
                 .string()
                 .optional()
-                .describe('Latest file date (ISO date, e.g. "2026-12-31").'),
+                .describe('Latest file date (ISO date, e.g. "2026-12-31"). A date-only value covers that whole calendar day in the server\'s local timezone.'),
             modified_after: z
                 .string()
                 .optional()
-                .describe('Earliest modification time (ISO date).'),
+                .describe('Earliest modification time (ISO date). A date-only value means the start of that calendar day in the server\'s local timezone.'),
             modified_before: z
                 .string()
                 .optional()
-                .describe('Latest modification time (ISO date).'),
+                .describe('Latest modification time (ISO date). A date-only value covers that whole calendar day in the server\'s local timezone.'),
             exact_phrase: z
                 .string()
                 .optional()
