@@ -3418,7 +3418,7 @@ async function main() {
         const { resolveIndexCacheDir } = await import('../dist/config.js');
         const { handlePlanCleanup } = await import('../dist/tools.js');
         const { default: nodeCrypto } = await import('node:crypto');
-        const cacheDir = resolveIndexCacheDir(libDir);
+        const cacheDir = resolveIndexCacheDir(await fs.realpath(libDir));
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
         const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
@@ -3473,7 +3473,7 @@ async function main() {
       try {
         const { resolveIndexCacheDir } = await import('../dist/config.js');
         const { handlePlanCleanup } = await import('../dist/tools.js');
-        const cacheDir = resolveIndexCacheDir(libDir);
+        const cacheDir = resolveIndexCacheDir(await fs.realpath(libDir));
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
         const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
@@ -3505,7 +3505,7 @@ async function main() {
       try {
         const { resolveIndexCacheDir } = await import('../dist/config.js');
         const { handlePlanCleanup } = await import('../dist/tools.js');
-        const cacheDir = resolveIndexCacheDir(libDir);
+        const cacheDir = resolveIndexCacheDir(await fs.realpath(libDir));
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
         const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
@@ -3536,7 +3536,7 @@ async function main() {
         try {
           const { resolveIndexCacheDir } = await import('../dist/config.js');
           const { handlePlanCleanup } = await import('../dist/tools.js');
-          const cacheDir = resolveIndexCacheDir(libDir);
+          const cacheDir = resolveIndexCacheDir(await fs.realpath(libDir));
           const backend = new LocalStorageBackend(libDir);
           const idx = new LocalSearchIndex(libDir, libDir, backend);
           const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
@@ -3572,7 +3572,7 @@ async function main() {
       try {
         const { resolveIndexCacheDir } = await import('../dist/config.js');
         const { handlePlanCleanup } = await import('../dist/tools.js');
-        const cacheDir = resolveIndexCacheDir(libDir);
+        const cacheDir = resolveIndexCacheDir(await fs.realpath(libDir));
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
         const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
@@ -3603,7 +3603,7 @@ async function main() {
       try {
         const { resolveIndexCacheDir } = await import('../dist/config.js');
         const { handlePlanCleanup } = await import('../dist/tools.js');
-        const cacheDir = resolveIndexCacheDir(libDir);
+        const cacheDir = resolveIndexCacheDir(await fs.realpath(libDir));
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
         const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
@@ -3636,7 +3636,7 @@ async function main() {
       try {
         const { resolveIndexCacheDir } = await import('../dist/config.js');
         const { handlePlanCleanup } = await import('../dist/tools.js');
-        const cacheDir = resolveIndexCacheDir(libDir);
+        const cacheDir = resolveIndexCacheDir(await fs.realpath(libDir));
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
         const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
