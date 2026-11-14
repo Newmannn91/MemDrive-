@@ -3378,7 +3378,7 @@ async function main() {
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
         const { buildCleanupPlan } = await import('../dist/tools.js');
-        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
         const now = Date.now();
         const t3h = new Date(now - 3 * 60 * 60 * 1000);
         const t2h = new Date(now - 2 * 60 * 60 * 1000);
@@ -3421,7 +3421,7 @@ async function main() {
         const cacheDir = resolveIndexCacheDir(libDir);
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
-        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
         const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
         const orphanPath = path.join(libDir, 'assets', 'orphan.png');
         await fs.writeFile(orphanPath, 'fake-png');
@@ -3476,7 +3476,7 @@ async function main() {
         const cacheDir = resolveIndexCacheDir(libDir);
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
-        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
         await fs.writeFile(path.join(libDir, '.gitkeep'), '');
         await fs.writeFile(path.join(libDir, '.git/x'), '');
         await fs.writeFile(path.join(libDir, 'empty.txt'), '');
@@ -3508,7 +3508,7 @@ async function main() {
         const cacheDir = resolveIndexCacheDir(libDir);
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
-        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
         await fs.writeFile(path.join(libDir, 'Archive/old.txt'), '');
         await fs.writeFile(path.join(libDir, 'empty.txt'), '');
         await idx.buildAll();
@@ -3539,7 +3539,7 @@ async function main() {
           const cacheDir = resolveIndexCacheDir(libDir);
           const backend = new LocalStorageBackend(libDir);
           const idx = new LocalSearchIndex(libDir, libDir, backend);
-          const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+          const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
           await fs.writeFile(path.join(libDir, 'meeting 10:30.md'), '');
           await fs.writeFile(path.join(libDir, 'empty.txt'), '');
           await idx.buildAll();
@@ -3575,7 +3575,7 @@ async function main() {
         const cacheDir = resolveIndexCacheDir(libDir);
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
-        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
         await idx.buildAll();
         const res = await handlePlanCleanup(ctx);
         const text = textOf(res);
@@ -3606,7 +3606,7 @@ async function main() {
         const cacheDir = resolveIndexCacheDir(libDir);
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
-        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
         await idx.buildAll();
         const res = await handlePlanCleanup(ctx);
         const text = textOf(res);
@@ -3639,7 +3639,7 @@ async function main() {
         const cacheDir = resolveIndexCacheDir(libDir);
         const backend = new LocalStorageBackend(libDir);
         const idx = new LocalSearchIndex(libDir, libDir, backend);
-        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const ctx = { backend, rootDir: libDir, rootRealDir: await fs.realpath(libDir), searchIndex: idx };
         await idx.buildAll();
         process.env['MEMDRIVE_INDEX_MAX_BYTES'] = '1000';
         let res;
