@@ -80,6 +80,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { atomicWrite } from './atomic.js';
+import { RESPONSE_BUDGET_HOST_BYTES } from './config.js';
 
 /** The MCP server entry written into a host config file. */
 export interface HostConfigEntry {
@@ -224,7 +225,7 @@ export async function expandOneStarPattern(
     if (!matcher.test(entry)) {
       continue;
     }
-    const candidate = pathMod.join(parent, entry, ...rest);
+    const candidate = pathMod.join(parent === '' ? pathMod.sep : parent, entry, ...rest);
     if (await probeExists(deps, candidate)) {
       results.push(candidate);
     }
@@ -332,7 +333,7 @@ export const cursorAdapter: HostConfigAdapter = {
   serversKey: 'mcpServers',
   serverKey: 'memdrive',
   entryType: 'stdio',
-  responseBudgetBytes: 10_000_000,
+  responseBudgetBytes: RESPONSE_BUDGET_HOST_BYTES,
   createIfMissing: true,
   findConfigPaths: async (deps: HostProbeDeps): Promise<string[]> => {
     const platform = probePlatform(deps);
@@ -368,7 +369,7 @@ export const vscodeAdapter: HostConfigAdapter = {
   serversKey: 'mcpServers',
   serverKey: 'memdrive',
   entryType: 'stdio',
-  responseBudgetBytes: 10_000_000,
+  responseBudgetBytes: RESPONSE_BUDGET_HOST_BYTES,
   createIfMissing: true,
   findConfigPaths: async (deps: HostProbeDeps): Promise<string[]> => {
     const platform = probePlatform(deps);
@@ -407,7 +408,7 @@ export const claudeCodeAdapter: HostConfigAdapter = {
   displayName: 'Claude Code',
   serversKey: 'mcpServers',
   serverKey: 'memdrive',
-  responseBudgetBytes: 10_000_000,
+  responseBudgetBytes: RESPONSE_BUDGET_HOST_BYTES,
   findConfigPaths: async (deps: HostProbeDeps): Promise<string[]> => {
     const env = probeEnv(deps);
     const home = probeHome(deps);
@@ -532,7 +533,10 @@ export function mergeConfigJson(
 ): MergeConfigResult {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(existingText);
+    // A UTF-8 BOM is a single leading U+FEFF; strip it before parsing
+    // (it is not valid JSON whitespace). Only the leading one: a U+FEFF
+    // elsewhere is real content, not a BOM.
+    parsed = JSON.parse(existingText.replace(/^\uFEFF/, ''));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, reason: `Config file is not valid JSON: ${message}` };

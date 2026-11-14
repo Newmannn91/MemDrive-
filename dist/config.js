@@ -9,6 +9,8 @@
 import crypto from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
+/** Server version (single source of truth; index.ts and net-guard.ts import it). */
+export const VERSION = '0.9.0';
 /** Maximum text payload returned by read_file. Larger files are truncated. */
 export const TEXT_MAX_BYTES = 1_000_000;
 /**
@@ -37,6 +39,11 @@ export const TEXT_MAX_BYTES = 1_000_000;
  * was measured. Unknown hosts keep this default.
  */
 export const RESPONSE_BUDGET_DEFAULT_BYTES = 950_000;
+/**
+ * Response budget the setup wizard writes for Cursor, VS Code, and
+ * Claude Code (see the per-host overrides paragraph above).
+ */
+export const RESPONSE_BUDGET_HOST_BYTES = 10_000_000;
 /** Smallest total response budget the environment variable may set. */
 export const RESPONSE_BUDGET_MIN_BYTES = 100_000;
 /** Largest total response budget the environment variable may set. */
@@ -99,17 +106,19 @@ export const IMAGE_PREVIEW_MIN_DIMENSION = 64;
  * to the largest size the budget allows.
  */
 export const IMAGE_PREVIEW_SCALE_STEP = 0.9;
+/** Image extension → MIME type (lowercase, with leading dot). Single source of truth for the image extension set. */
+export const IMAGE_MIME_BY_EXTENSION = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.bmp': 'image/bmp',
+    '.tiff': 'image/tiff',
+    '.tif': 'image/tiff',
+};
 /** File extensions treated as images (lowercase, with leading dot). */
-export const IMAGE_EXTENSIONS = new Set([
-    '.png',
-    '.jpg',
-    '.jpeg',
-    '.webp',
-    '.gif',
-    '.bmp',
-    '.tiff',
-    '.tif',
-]);
+export const IMAGE_EXTENSIONS = new Set(Object.keys(IMAGE_MIME_BY_EXTENSION));
 /** `.svg` files are XML text: read_file returns them as text, never as image content. */
 export const SVG_EXTENSION = '.svg';
 /** Upper bound on search results returned by search_files. */
@@ -247,6 +256,25 @@ export function resolveSearchMaxBytes(rawValue) {
     }
     return floored;
 }
+/** First value that is non-empty and absolute, or undefined. */
+function firstAbsolute(...values) {
+    for (const value of values) {
+        const trimmed = value?.trim();
+        if (trimmed !== undefined && trimmed.length > 0 && path.isAbsolute(trimmed)) {
+            return trimmed;
+        }
+    }
+    return undefined;
+}
+/** Expand a leading `~` / `~/` to the home directory (same rule as resolveRootDir). */
+function expandTilde(p) {
+    if (p === '~')
+        return homedir();
+    if (p.startsWith('~/') || p.startsWith('~\\')) {
+        return path.join(homedir(), p.slice(2).replace(/\\/g, '/'));
+    }
+    return p;
+}
 /**
  * Resolve the directory that holds this library's search index.
  *
@@ -260,25 +288,22 @@ export function resolveIndexCacheDir(rootRealDir) {
     const override = process.env['MEMDRIVE_CACHE_DIR']?.trim();
     let base;
     if (override !== undefined && override.length > 0) {
-        base = override;
+        base = expandTilde(override);
     }
     else if (process.platform === 'win32') {
-        base =
-            process.env['LOCALAPPDATA'] ??
-                process.env['APPDATA'] ??
-                path.join(homedir(), '.cache');
-        base = path.join(base, 'memdrive-mcp');
+        base = path.join(firstAbsolute(process.env['LOCALAPPDATA'], process.env['APPDATA']) ??
+            path.join(homedir(), '.cache'), 'memdrive-mcp');
     }
     else if (process.platform === 'darwin') {
         base = path.join(homedir(), 'Library', 'Caches', 'memdrive-mcp');
     }
     else {
-        base = path.join(process.env['XDG_CACHE_HOME'] ?? path.join(homedir(), '.cache'), 'memdrive-mcp');
+        base = path.join(firstAbsolute(process.env['XDG_CACHE_HOME']) ?? path.join(homedir(), '.cache'), 'memdrive-mcp');
     }
     const subdir = crypto
         .createHash('sha256')
         .update(rootRealDir)
         .digest('hex')
         .slice(0, 16);
-    return path.join(base, subdir);
+    return path.resolve(path.join(base, subdir));
 }

@@ -110,6 +110,10 @@ async function realLocation(
           if (linkError instanceof SandboxError) {
             throw linkError;
           }
+          const linkCode = (linkError as NodeJS.ErrnoException).code;
+          if (linkCode !== 'ENOENT' && linkCode !== 'EINVAL') {
+            throw linkError;
+          }
         }
       }
       const parent = path.dirname(current);
@@ -166,7 +170,20 @@ export async function atomicWrite(
   const fh = await open(tmp, 'wx', mode ?? 0o666);
   try {
     await fh.writeFile(data);
-    await fh.sync();
+    try {
+      await fh.sync();
+    } catch (error) {
+      // Filesystems without fsync support (some FUSE / network mounts)
+      // throw EINVAL / ENOTSUP / EOPNOTSUPP from sync() after the data
+      // is already written. atomicWrite continues with close and rename
+      // after sync, so ignoring these three codes is safe: the write +
+      // close path already pushed the data through, which is sufficient
+      // durability for a local note store. Any other error still throws.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP') {
+        throw error;
+      }
+    }
     await fh.close();
     if (mode !== undefined) {
       await chmod(tmp, mode);

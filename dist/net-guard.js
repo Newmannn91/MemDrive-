@@ -21,6 +21,7 @@ import dns from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import { VERSION } from './config.js';
 export class BlockedUrlError extends Error {
     reason;
     constructor(reason) {
@@ -48,6 +49,7 @@ export function isPublicIpv4(ip) {
     }
     const a = octets[0] ?? 0;
     const b = octets[1] ?? 0;
+    const c = octets[2] ?? 0;
     if (a === 0)
         return false; // 0.0.0.0/8: "this network"
     if (a === 10)
@@ -62,6 +64,16 @@ export function isPublicIpv4(ip) {
         return false; // 172.16.0.0/12: private
     if (a === 192 && b === 168)
         return false; // 192.168.0.0/16: private
+    if (a === 192 && b === 0 && c === 0)
+        return false; // 192.0.0.0/24: IETF protocol assignments
+    if (a === 192 && b === 0 && c === 2)
+        return false; // 192.0.2.0/24: TEST-NET-1
+    if (a === 198 && b === 51 && c === 100)
+        return false; // 198.51.100.0/24: TEST-NET-2
+    if (a === 198 && b >= 18 && b <= 19)
+        return false; // 198.18.0.0/15: benchmarking (TUN/VPN fake-IP)
+    if (a === 203 && b === 0 && c === 113)
+        return false; // 203.0.113.0/24: TEST-NET-3
     if (a >= 224)
         return false; // 224.0.0.0/4: multicast; 240.0.0.0/4: reserved
     return true;
@@ -287,22 +299,27 @@ export function safeRequest(rawUrl, opts = {}) {
             ...(lookup !== undefined ? { lookup } : {}),
             ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
             headers: {
-                'User-Agent': 'memdrive-mcp/0.8.2',
+                'User-Agent': `memdrive-mcp/${VERSION}`,
                 Accept: 'image/*',
                 ...opts.headers,
             },
         }, (res) => {
             if (opts.signal !== undefined) {
                 if (opts.signal.aborted) {
-                    res.destroy(opts.signal.reason instanceof Error
+                    const reason = opts.signal.reason instanceof Error
                         ? opts.signal.reason
-                        : new Error('The operation was aborted'));
+                        : new Error('The operation was aborted');
+                    res.once('error', () => { });
+                    res.destroy(reason);
+                    reject(reason);
                     return;
                 }
                 const onAbort = () => {
-                    res.destroy(opts.signal?.reason instanceof Error
+                    const reason = opts.signal?.reason instanceof Error
                         ? opts.signal.reason
-                        : new Error('The operation was aborted'));
+                        : new Error('The operation was aborted');
+                    res.once('error', () => { });
+                    res.destroy(reason);
                 };
                 opts.signal.addEventListener('abort', onAbort, { once: true });
                 res.once('close', () => {

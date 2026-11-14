@@ -25,6 +25,7 @@ import {
   CLIPBOARD_COMMAND_TIMEOUT_MS,
   CLIPBOARD_MAX_BYTES,
 } from './config.js';
+import { detectImageMime } from './images.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -33,39 +34,6 @@ export type ClipboardResult =
   | { kind: 'text'; text: string }
   | { kind: 'empty' }
   | { kind: 'unsupported'; reason: string };
-
-function isPng(data: Buffer): boolean {
-  return (
-    data.length >= 8 &&
-    data[0] === 0x89 &&
-    data[1] === 0x50 &&
-    data[2] === 0x4e &&
-    data[3] === 0x47
-  );
-}
-
-function detectMime(data: Buffer): string | null {
-  if (isPng(data)) {
-    return 'image/png';
-  }
-  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  if (data.length >= 3 && data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) {
-    return 'image/gif';
-  }
-  if (data.length >= 2 && data[0] === 0x42 && data[1] === 0x4d) {
-    return 'image/bmp';
-  }
-  if (
-    data.length >= 12 &&
-    data.subarray(0, 4).toString('ascii') === 'RIFF' &&
-    data.subarray(8, 12).toString('ascii') === 'WEBP'
-  ) {
-    return 'image/webp';
-  }
-  return null;
-}
 
 /**
  * Run a clipboard command. `ranOk` is true only when the command
@@ -150,10 +118,8 @@ function stderrMeansEmpty(stderr: string): boolean {
 
 /** macOS: ask AppleScript to write the clipboard PNG to a temp file. */
 async function readMacOs(): Promise<ClipboardResult> {
-  const tmp = path.join(
-    os.tmpdir(),
-    `memdrive-clipboard-${process.pid}-${Date.now()}.png`,
-  );
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'memdrive-clipboard-'));
+  const tmp = path.join(dir, 'clip.png');
   try {
     const script =
       'set pngData to the clipboard as «class PNGf»\n' +
@@ -164,8 +130,15 @@ async function readMacOs(): Promise<ClipboardResult> {
       timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
       windowsHide: true,
     });
+    const stat = await fs.stat(tmp);
+    if (stat.size > CLIPBOARD_MAX_BYTES) {
+      return {
+        kind: 'unsupported',
+        reason: `Clipboard image is too large (${stat.size} bytes; limit is ${CLIPBOARD_MAX_BYTES} bytes). Use a file path or image URL instead.`,
+      };
+    }
     const data = await fs.readFile(tmp);
-    if (isPng(data)) {
+    if (detectImageMime(data) === 'image/png') {
       return { kind: 'image', data, mimeType: 'image/png' };
     }
     return { kind: 'empty' };
@@ -191,21 +164,19 @@ async function readMacOs(): Promise<ClipboardResult> {
       };
     }
   } finally {
-    await fs.unlink(tmp).catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
 /** Windows: PowerShell + System.Windows.Forms.Clipboard (STA thread). */
 async function readWindows(): Promise<ClipboardResult> {
-  const tmp = path.join(
-    os.tmpdir(),
-    `memdrive-clipboard-${process.pid}-${Date.now()}.png`,
-  );
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'memdrive-clipboard-'));
+  const tmp = path.join(dir, 'clip.png');
   // Exit codes: 0 = image saved, 2 = clipboard empty, 3 = text on stdout.
   const script = [
     'Add-Type -AssemblyName System.Windows.Forms',
     '$img = [System.Windows.Forms.Clipboard]::GetImage()',
-    `if ($img -ne $null) { $img.Save(${JSON.stringify(tmp)}, [System.Drawing.Imaging.ImageFormat]::Png); exit 0 }`,
+    `if ($img -ne $null) { $img.Save('${tmp.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png); exit 0 }`,
     '$text = [System.Windows.Forms.Clipboard]::GetText()',
     'if ([string]::IsNullOrEmpty($text)) { exit 2 }',
     '[Console]::Out.Write($text); exit 3',
@@ -231,8 +202,15 @@ async function readWindows(): Promise<ClipboardResult> {
     );
     // execFile only resolves when the exit code is 0, so reaching here
     // means an image was saved.
+    const stat = await fs.stat(tmp);
+    if (stat.size > CLIPBOARD_MAX_BYTES) {
+      return {
+        kind: 'unsupported',
+        reason: `Clipboard image is too large (${stat.size} bytes; limit is ${CLIPBOARD_MAX_BYTES} bytes). Use a file path or image URL instead.`,
+      };
+    }
     const data = await fs.readFile(tmp);
-    if (isPng(data)) {
+    if (detectImageMime(data) === 'image/png') {
       return { kind: 'image', data, mimeType: 'image/png' };
     }
     return { kind: 'empty' };
@@ -245,6 +223,7 @@ async function readWindows(): Promise<ClipboardResult> {
       if (text.length > 0) {
         return { kind: 'text', text };
       }
+      return { kind: 'empty' };
     }
     if (code === 2) {
       return { kind: 'empty' };
@@ -255,7 +234,7 @@ async function readWindows(): Promise<ClipboardResult> {
         'Could not read the Windows clipboard (PowerShell clipboard access failed). Use a file path or image URL instead.',
     };
   } finally {
-    await fs.unlink(tmp).catch(() => undefined);
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -276,7 +255,7 @@ async function readLinux(): Promise<ClipboardResult> {
     const { data, ranOk, stderr } = await runBuffer(command, args);
     anyRanOk = anyRanOk || ranOk || stderrMeansEmpty(stderr);
     if (data !== null) {
-      const mimeType = detectMime(data);
+      const mimeType = detectImageMime(data);
       if (mimeType !== null) {
         return { kind: 'image', data, mimeType };
       }

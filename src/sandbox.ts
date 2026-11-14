@@ -26,6 +26,9 @@ import { SandboxError } from './errors.js';
  * forward slashes) and `.`/`..` segments.
  */
 export function cleanPath(input: string): string {
+  if (input.includes('\0')) {
+    throw new SandboxError(`Path contains a NUL byte: ${JSON.stringify(input)}`);
+  }
   let p = input.trim();
   // Strip surrounding quotes, one layer at a time.
   for (;;) {
@@ -50,18 +53,37 @@ export function cleanPath(input: string): string {
   return path.normalize(unified);
 }
 
+export function decodeUserPath(input: string): string {
+  // Strip a query suffix (not part of the on-disk path), then
+  // percent-decode. Do NOT strip `#`: it is a legitimate filename
+  // character in user-supplied paths (e.g. a `C#` directory) — only
+  // Obsidian embeds use `#` as an anchor, and those never reach this
+  // helper (resolveImageAbs handles Obsidian refs in its own branch,
+  // and resolveImageRef strips `#` for Obsidian refs itself). A bad
+  // escape keeps the raw input. Callers that need a literal `%` in a
+  // filename check the literal path first (see sandboxPath /
+  // resolveImageAbs).
+  const cutAt = input.search(/\?/);
+  const stripped = cutAt === -1 ? input : input.slice(0, cutAt);
+  try {
+    return decodeURIComponent(stripped);
+  } catch {
+    return stripped;
+  }
+}
+
 /** True when `target` is `dir` itself or lives underneath it. */
 export function isInside(dir: string, target: string): boolean {
   let d = dir;
   let t = target;
   // On case-insensitive filesystems (macOS/Windows) the configured
   // root's case may differ from the on-disk case, and macOS stores
-  // filenames NFD while input is usually NFC. Compare NFKC-normalized,
+  // filenames NFD while input is usually NFC. Compare NFC-normalized,
   // lowercased paths there so a case/normalization mismatch does not
   // falsely report an escape. Linux stays exact (case-sensitive FS).
   if (process.platform === 'darwin' || process.platform === 'win32') {
-    d = dir.normalize('NFKC').toLowerCase();
-    t = target.normalize('NFKC').toLowerCase();
+    d = dir.normalize('NFC').toLowerCase();
+    t = target.normalize('NFC').toLowerCase();
   }
   const rel = path.relative(d, t);
   return (
@@ -101,8 +123,7 @@ const WINDOWS_RESERVED_NAMES = new Set([
  * extension), NTFS alternate-data-stream segments (`a.md:$DATA`),
  * segments ending in a dot or space (Windows strips them, so the
  * on-disk name would differ from the requested one), and UNC paths.
- * A leading Windows drive letter (`C:`) is allowed and skipped. A
- * file that is safe on macOS/Linux but unreadable on Windows is a
+ * A file that is safe on macOS/Linux but unreadable on Windows is a
  * sync-time trap, so the check runs on every platform.
  */
 export function validateCrossPlatformSegments(input: string): void {
@@ -113,12 +134,14 @@ export function validateCrossPlatformSegments(input: string): void {
   const segments = unified.split('/').filter((s) => s.length > 0 && s !== '.' && s !== '..');
   for (let i = 0; i < segments.length; i += 1) {
     const seg = segments[i] as string;
-    if (i === 0 && /^[A-Za-z]:$/.test(seg)) {
-      continue; // Windows drive letter.
-    }
     if (seg.includes(':')) {
       throw new SandboxError(
         `Path segment contains ':' (NTFS alternate data stream): ${JSON.stringify(seg)}`,
+      );
+    }
+    if (/[<>"|?*\x00-\x1f]/.test(seg)) {
+      throw new SandboxError(
+        `Path segment contains a character not allowed on Windows: ${JSON.stringify(seg)}`,
       );
     }
     if (seg.endsWith('.') || seg.endsWith(' ')) {
@@ -126,7 +149,7 @@ export function validateCrossPlatformSegments(input: string): void {
         `Path segment ends with a dot or space (not portable to Windows): ${JSON.stringify(seg)}`,
       );
     }
-    const stem = (seg.split('.')[0] as string).toUpperCase();
+    const stem = (seg.split('.')[0] as string).trimEnd().toUpperCase();
     if (WINDOWS_RESERVED_NAMES.has(stem)) {
       throw new SandboxError(
         `Path segment is a Windows reserved device name: ${JSON.stringify(seg)}`,
@@ -173,6 +196,12 @@ async function realLocation(absolutePath: string, depth = 0): Promise<string> {
       return result;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP') {
+        throw new SandboxError(`Too many levels of symbolic links: ${absolutePath}`);
+      }
+      if (code === 'ERR_INVALID_ARG_VALUE') {
+        throw new SandboxError(`Invalid path (NUL byte or invalid argument): ${absolutePath}`);
+      }
       if (code !== 'ENOENT' && code !== 'ENOTDIR') {
         throw error;
       }
@@ -181,7 +210,8 @@ async function realLocation(absolutePath: string, depth = 0): Promise<string> {
           const lst = await fs.lstat(current);
           if (lst.isSymbolicLink()) {
             const linkTarget = await fs.readlink(current);
-            const resolvedLink = path.resolve(path.dirname(current), linkTarget);
+            const parentReal = await realLocation(path.dirname(current), depth + 1);
+            const resolvedLink = path.resolve(parentReal, linkTarget);
             const realTarget = await realLocation(resolvedLink, depth + 1);
             let result = realTarget;
             for (let i = missing.length - 1; i >= 0; i -= 1) {
@@ -234,7 +264,20 @@ export async function sandboxPath(
   rootRealDir: string,
   input: string,
 ): Promise<string> {
-  const absolute = resolveInRoot(rootDir, input);
+  // A user/model-supplied path may be percent-encoded
+  // (`assets/my%20pic.png`); decode it, but prefer the literal path
+  // when it exists (a file can legitimately contain `%` in its name).
+  const decoded = decodeUserPath(input);
+  if (decoded !== input) {
+    try {
+      const literalAbs = resolveInRoot(rootDir, input);
+      await fs.stat(literalAbs);
+      return assertInsideRealRoot(rootRealDir, literalAbs);
+    } catch {
+      // Literal path does not exist (or escapes): fall through to decoded.
+    }
+  }
+  const absolute = resolveInRoot(rootDir, decoded);
   return assertInsideRealRoot(rootRealDir, absolute);
 }
 
@@ -260,6 +303,27 @@ export async function sandboxPathForWrite(
 
 /** Root-relative POSIX-style path (forward slashes) for display and storage. */
 export function toDisplayPath(rootDir: string, absolutePath: string): string {
-  const rel = path.relative(rootDir, absolutePath);
-  return rel === '' ? '.' : rel.split(path.sep).join('/');
+  // On case-insensitive filesystems the root's case/NFD form may differ
+  // from the on-disk case, so path.relative on the raw inputs can produce
+  // ../../../... even though isInside accepts the path. Match leading
+  // segments on normalized forms, then return that many trailing segments
+  // from the ORIGINAL absolutePath so the returned case is preserved.
+  const norm = (p: string): string =>
+    process.platform === 'darwin' || process.platform === 'win32'
+      ? p.normalize('NFC').toLowerCase()
+      : p;
+  const dSegs = norm(rootDir).split(path.sep).filter((s) => s.length > 0);
+  const tSegs = norm(absolutePath).split(path.sep).filter((s) => s.length > 0);
+  let common = 0;
+  while (common < dSegs.length && common < tSegs.length && dSegs[common] === tSegs[common]) {
+    common += 1;
+  }
+  if (common < dSegs.length) {
+    // Not inside the root (should not happen for sandbox-checked paths).
+    const rawRel = path.relative(rootDir, absolutePath);
+    return rawRel === '' ? '.' : rawRel.split(path.sep).join('/');
+  }
+  const origSegs = absolutePath.split(path.sep).filter((s) => s.length > 0);
+  const tail = origSegs.slice(common);
+  return tail.length === 0 ? '.' : tail.join('/');
 }

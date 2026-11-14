@@ -79,6 +79,7 @@ import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { atomicWrite } from './atomic.js';
+import { RESPONSE_BUDGET_HOST_BYTES } from './config.js';
 function probePlatform(deps) {
     return deps.platform ?? process.platform;
 }
@@ -141,7 +142,7 @@ export async function expandOneStarPattern(pattern, pathMod, deps) {
         if (!matcher.test(entry)) {
             continue;
         }
-        const candidate = pathMod.join(parent, entry, ...rest);
+        const candidate = pathMod.join(parent === '' ? pathMod.sep : parent, entry, ...rest);
         if (await probeExists(deps, candidate)) {
             results.push(candidate);
         }
@@ -220,7 +221,7 @@ export const cursorAdapter = {
     serversKey: 'mcpServers',
     serverKey: 'memdrive',
     entryType: 'stdio',
-    responseBudgetBytes: 10_000_000,
+    responseBudgetBytes: RESPONSE_BUDGET_HOST_BYTES,
     createIfMissing: true,
     findConfigPaths: async (deps) => {
         const platform = probePlatform(deps);
@@ -255,7 +256,7 @@ export const vscodeAdapter = {
     serversKey: 'mcpServers',
     serverKey: 'memdrive',
     entryType: 'stdio',
-    responseBudgetBytes: 10_000_000,
+    responseBudgetBytes: RESPONSE_BUDGET_HOST_BYTES,
     createIfMissing: true,
     findConfigPaths: async (deps) => {
         const platform = probePlatform(deps);
@@ -293,7 +294,7 @@ export const claudeCodeAdapter = {
     displayName: 'Claude Code',
     serversKey: 'mcpServers',
     serverKey: 'memdrive',
-    responseBudgetBytes: 10_000_000,
+    responseBudgetBytes: RESPONSE_BUDGET_HOST_BYTES,
     findConfigPaths: async (deps) => {
         const env = probeEnv(deps);
         const home = probeHome(deps);
@@ -394,7 +395,10 @@ export function backupPathFor(configPath, existsSync, now = new Date()) {
 export function mergeConfigJson(existingText, adapter, entry) {
     let parsed;
     try {
-        parsed = JSON.parse(existingText);
+        // A UTF-8 BOM is a single leading U+FEFF; strip it before parsing
+        // (it is not valid JSON whitespace). Only the leading one: a U+FEFF
+        // elsewhere is real content, not a BOM.
+        parsed = JSON.parse(existingText.replace(/^\uFEFF/, ''));
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);

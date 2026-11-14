@@ -22,6 +22,7 @@ import { Jimp } from 'jimp';
 
 import { readClipboardImage } from './clipboard.js';
 import {
+  IMAGE_MIME_BY_EXTENSION,
   IMAGE_PREVIEW_MAX_BYTES,
   IMAGE_PREVIEW_MIME,
   IMAGE_PREVIEW_MIN_DIMENSION,
@@ -81,17 +82,6 @@ function downloadBudgetNote(): string {
   return `download limit for this save (${SAVE_IMAGES_MAX_DOWNLOAD_BYTES / 1_000_000} MB) was reached`;
 }
 
-const MIME_BY_EXTENSION: Record<string, string> = {
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-  '.gif': 'image/gif',
-  '.bmp': 'image/bmp',
-  '.tiff': 'image/tiff',
-  '.tif': 'image/tiff',
-};
-
 const EXTENSION_BY_MIME: Record<string, string> = {
   'image/png': 'png',
   'image/jpeg': 'jpg',
@@ -103,7 +93,7 @@ const EXTENSION_BY_MIME: Record<string, string> = {
 
 export function mimeFromExtension(filePath: string): string | null {
   const ext = path.extname(filePath).toLowerCase();
-  return Object.hasOwn(MIME_BY_EXTENSION, ext) ? (MIME_BY_EXTENSION[ext] ?? null) : null;
+  return Object.hasOwn(IMAGE_MIME_BY_EXTENSION, ext) ? (IMAGE_MIME_BY_EXTENSION[ext] ?? null) : null;
 }
 
 export function extensionForMime(mimeType: string): string {
@@ -296,11 +286,11 @@ async function downloadImage(
     ? rawContentType[0]
     : rawContentType;
   const headerType = contentTypeStr?.split(';')[0]?.trim().toLowerCase();
-  const mimeType =
-    detectImageMime(data) ??
-    (headerType !== undefined && Object.hasOwn(EXTENSION_BY_MIME, headerType)
-      ? headerType
-      : null);
+  // Magic bytes are authoritative: a `200 OK` HTML error page or a
+  // 0-byte body served as `image/png` is not an image. detectImageMime
+  // recognizes all six raster formats this code supports, so dropping
+  // the Content-Type fallback excludes nothing legitimate.
+  const mimeType = detectImageMime(data);
   if (mimeType === null) {
     return {
       ok: false,
@@ -318,7 +308,7 @@ async function downloadImage(
   }
   let stem = 'image';
   try {
-    stem = baseNameOf(new URL(url).pathname);
+    stem = baseNameOf(new URL(current).pathname);
   } catch {
     // Keep the default stem.
   }
@@ -362,13 +352,11 @@ async function copyLocalImage(spec: string, budget?: ImageSaveBudget): Promise<I
   if (budget !== undefined && data.length > budget.storedRemainingBytes) {
     return { ok: false, note: `${storedBudgetNote()}.` };
   }
-  const extMime = mimeFromExtension(absolute);
-  const mimeType =
-    extMime !== null
-      ? (detectImageMime(data) ?? extMime)
-      : path.extname(absolute) === ''
-        ? detectImageMime(data)
-        : null;
+  // Magic bytes are authoritative here too: a file whose extension
+  // claims an image but whose bytes are not one (or are empty) is not
+  // an image. This also covers the extensionless case, which already
+  // used detectImageMime alone.
+  const mimeType = detectImageMime(data);
   if (mimeType === null) {
     return {
       ok: false,
@@ -508,7 +496,7 @@ export async function makePreview(
           return { data: preview, mimeType: IMAGE_PREVIEW_MIME };
         }
       }
-      if (width <= IMAGE_PREVIEW_MIN_DIMENSION || height <= IMAGE_PREVIEW_MIN_DIMENSION) {
+      if (width <= IMAGE_PREVIEW_MIN_DIMENSION && height <= IMAGE_PREVIEW_MIN_DIMENSION) {
         // Last resort: same minimum size, lower JPEG quality.
         for (const quality of [60, 40, 20]) {
           const smaller = await working.getBuffer(IMAGE_PREVIEW_MIME, {
@@ -586,6 +574,12 @@ export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
         trimmed = trimmed.slice(0, queryAt).trim();
       }
     }
+    // A raw `#fragment` is a same-document anchor, not a file — check
+    // BEFORE decoding, so a percent-encoded `#` in a filename (`%23`)
+    // survives (it decodes to `#` only after this check).
+    if (trimmed.startsWith('#')) {
+      return;
+    }
     // Newly saved notes carry percent-encoded refs; decode them back
     // to the on-disk path. A bad escape falls back to the raw src.
     try {
@@ -603,17 +597,16 @@ export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
       trimmed.length === 0 ||
       seen.has(`${kind}:${trimmed}`) ||
       /^https?:\/\//i.test(trimmed) ||
-      trimmed.startsWith('data:') ||
-      trimmed.startsWith('#')
+      /^data:/i.test(trimmed)
     ) {
       return;
     }
     seen.add(`${kind}:${trimmed}`);
     refs.push({ src: trimmed, kind });
   };
-  const inlinePattern = /!\[[^\]]*\]\(\s*([^\s)]+)(?:\s+"[^"]*")?\s*\)/g;
+  const inlinePattern = /!\[(?:\\.|[^\]\\])*\]\(\s*(?:<([^>]*)>|([^\s)]+))(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
   for (const match of markdown.matchAll(inlinePattern)) {
-    const src = match[1];
+    const src = match[1] ?? match[2];
     if (src !== undefined) {
       push(src, 'inline');
     }
@@ -646,10 +639,10 @@ export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
       refDefs.set(id.toLowerCase(), src);
     }
   }
-  const refPattern = /!\[[^\]]*\]\[([^\]]*)\]/g;
+  const refPattern = /!\[(?:\\.|[^\]\\])*\]\[([^\]]*)\]/g;
   for (const match of markdown.matchAll(refPattern)) {
     const idRaw = match[1] as string;
-    const altMatch = /^!\[([^\]]*)\]/.exec(match[0]);
+    const altMatch = /^!\[((?:\\.|[^\]\\])*)\]/.exec(match[0]);
     const id = idRaw.length > 0 ? idRaw : (altMatch?.[1] ?? '');
     const src = refDefs.get(id.toLowerCase());
     if (src !== undefined) {

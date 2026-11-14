@@ -578,13 +578,41 @@ function stripFencedCode(text: string): string {
   return out.join('\n');
 }
 
+// Same helper as tools.ts `unescapeDoubleQuoted` — the two copies must
+// stay in sync (this file cannot import from tools.ts: import cycle).
+/** Unescape a double-quoted YAML scalar's content in a single left-to-right pass. */
+function unescapeDoubleQuoted(inner: string): string {
+  let out = '';
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i] as string;
+    if (ch === '\\' && i + 1 < inner.length) {
+      const next = inner[i + 1] as string;
+      if (next === '\\' || next === '"') {
+        out += next;
+        i++;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
 /** Extract tags: YAML front matter `tags:` + body `#tag`. Read-only. */
 export function extractTags(text: string): string[] {
   const tags = new Set<string>();
   // Tags are case-insensitive and never keep a leading '#': a query
   // for `project` must match `#Project` and front matter `#project`.
   const addTag = (raw: string): void => {
-    const tag = raw.trim().replace(/^['"]|['"]$/g, '').replace(/^#+/, '').trim().toLowerCase();
+    const trimmed = raw.trim();
+    let tag: string;
+    if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+      tag = unescapeDoubleQuoted(trimmed.slice(1, -1)).replace(/^#+/, '').trim().toLowerCase();
+    } else if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+      tag = trimmed.slice(1, -1).replace(/^#+/, '').trim().toLowerCase();
+    } else {
+      tag = trimmed.replace(/^['"]|['"]$/g, '').replace(/^#+/, '').trim().toLowerCase();
+    }
     // Reject only real dirty characters (brackets, braces,
     // quotes): a strict allowlist dropped legitimate front-matter
     // tags with spaces or dots (`machine learning`, `node.js`,
@@ -619,7 +647,7 @@ export function extractTags(text: string): string[] {
       // stripYamlComment. (Stripping the comment from the whole
       // line first ate ` #b]` and lost the tag — a 0.8.2
       // regression.)
-      const bracket = /^\[((?:[^\]"']|"[^"]*"|'[^']*')*)\]/.exec(value);
+      const bracket = /^\[((?:[^\]"']|"(?:\\.|[^"\\])*"|'[^']*')*)\]/.exec(value);
       if (bracket !== null) {
         for (const part of (bracket[1] as string).split(',')) {
           addTag(part);
@@ -805,6 +833,13 @@ function looksLikeText(data: Buffer): boolean {
   return !data.subarray(0, 8192).includes(0);
 }
 
+function canonicalRelPath(p: string): string {
+  const nfc = p.normalize('NFC');
+  return process.platform === 'darwin' || process.platform === 'win32'
+    ? nfc.toLowerCase()
+    : nfc;
+}
+
 /** SHA-256 hex of a buffer. */
 function sha256Hex(data: Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
@@ -855,6 +890,8 @@ export interface Diagnostics {
   brokenImageRefs: Array<{ file: string; src: string }>;
   orphanCandidates: string[];
   tags: Array<{ tag: string; count: number }>;
+  scanIncomplete: boolean;
+  skippedNotes: Array<{ file: string; reason: string }>;
 }
 
 /** Reciprocal rank fusion over ranked id lists: score = sum(1 / (k + rank)). */
@@ -1088,8 +1125,16 @@ export class LocalSearchIndex implements SearchIndex {
     if (process.platform !== 'darwin' || size === 0) {
       return false;
     }
-    const st = await this.backend.stat(relPath);
-    return st !== null && st.blocks === 0;
+    try {
+      const st = await this.backend.stat(relPath);
+      return st !== null && st.blocks === 0;
+    } catch {
+      // A stat failure (EACCES, EIO, ...) is not proof the file is
+      // dataless: proceed as a normal file. If the file is truly
+      // unreadable, the downstream read is already guarded (scanDiagnostics
+      // marks it 'read error'; the index build handles read failures).
+      return false;
+    }
   }
 
   /**
@@ -1098,7 +1143,7 @@ export class LocalSearchIndex implements SearchIndex {
    * (for filename-substring search). Placeholders and temp files
    * are skipped; symlinks escaping the root are skipped too.
    */
-  private async walkTextFiles(): Promise<{
+  private async walkTextFiles(onSkip?: (file: string, reason: string) => void): Promise<{
     files: Array<{ relPath: string; size: number; mtimeMs: number; nameOnly: boolean; dataless: boolean }>;
     allNames: string[];
   }> {
@@ -1113,16 +1158,25 @@ export class LocalSearchIndex implements SearchIndex {
     }
     const visited = new Set<string>([rootRealDir]);
     const queue: string[] = [''];
+    const pendingSymlinkDirs: Array<{ relPath: string; real: string }> = [];
     while (queue.length > 0) {
       const current = queue.shift() as string;
       let entries;
       try {
         entries = await this.backend.listDirectory(current);
       } catch {
+        onSkip?.(current === '' ? '.' : current, 'list error');
         continue;
       }
       for (const entry of entries) {
-        if (entry.name.startsWith('.mdtmp-') || isPlaceholderFile(entry.relPath)) {
+        if (isPlaceholderFile(entry.relPath)) {
+          const stripped = entry.relPath.replace(/\.[^.]+$/, '');
+          if (MARKDOWN_EXTENSIONS.has(path.extname(stripped).toLowerCase())) {
+            onSkip?.(entry.relPath, 'placeholder');
+          }
+          continue;
+        }
+        if (entry.name.startsWith('.')) {
           continue;
         }
         // listDirectory already statted the entry (following
@@ -1138,19 +1192,39 @@ export class LocalSearchIndex implements SearchIndex {
               continue;
             }
           } catch {
+            onSkip?.(entry.relPath, 'symlink target unreadable');
             continue;
           }
         }
         if (entry.type === 'directory') {
+          // [Issue 6] Case-insensitive check for top-level archive/
+          if (current === '' && entry.name.toLowerCase() === 'archive') {
+            // Record archive/'s realpath so a symlink into archive/
+            // is skipped too (it would otherwise walk archived files
+            // under a non-archive/ prefix).
+            try {
+              visited.add(await fs.realpath(path.join(this.rootDir, entry.relPath)));
+            } catch {
+              // Realpath failed: skip archive/ as before; the symlink
+              // will be caught by its own realpath check if reachable.
+            }
+            continue;
+          }
           // Directories are few: realpath for the loop guard.
           if (real === null) {
             try {
               real = await fs.realpath(path.join(this.rootDir, entry.relPath));
             } catch {
+              onSkip?.(entry.relPath, 'realpath failed');
               continue;
             }
           }
-          if (!visited.has(real)) {
+          if (entry.isSymlink) {
+            // Defer symlink directories: a real directory to the same
+            // target, listed in the same parent, must win the visited
+            // race so walked files carry the real relPath.
+            pendingSymlinkDirs.push({ relPath: entry.relPath, real });
+          } else if (!visited.has(real)) {
             visited.add(real);
             queue.push(entry.relPath);
           }
@@ -1188,6 +1262,13 @@ export class LocalSearchIndex implements SearchIndex {
           });
         }
       }
+      for (const pending of pendingSymlinkDirs) {
+        if (!visited.has(pending.real)) {
+          visited.add(pending.real);
+          queue.push(pending.relPath);
+        }
+      }
+      pendingSymlinkDirs.length = 0;
       // Yield between directories so a huge library never blocks the loop.
       await LocalSearchIndex.yieldLoop();
     }
@@ -2245,46 +2326,70 @@ export class LocalSearchIndex implements SearchIndex {
    */
   public async scanDiagnostics(scope?: string): Promise<Diagnostics> {
     const emptyFiles: string[] = [];
-    const byHash = new Map<string, string[]>();
+    const byHash = new Map<string, Array<{ relPath: string; mtimeMs: number }>>();
     const brokenImageRefs: Array<{ file: string; src: string }> = [];
     const tagCounts = new Map<string, number>();
     const underScope = (p: string): boolean =>
       scope === undefined || scope === '' || p === scope || p.startsWith(`${scope}/`);
     const referenced = new Set<string>();
+    let scanIncomplete = false;
+    const skippedNotes: Array<{ file: string; reason: string }> = [];
+    const noteSkipped = (file: string, reason: string): void => {
+      if (skippedNotes.some((s) => s.file === file && s.reason === reason)) {
+        return;
+      }
+      scanIncomplete = true;
+      skippedNotes.push({ file, reason });
+    };
     const maxBytes = resolveIndexMaxFileBytes(process.env['MEMDRIVE_INDEX_MAX_BYTES']);
     const indexReady = this.status === 'ready';
-    const { files } = await this.walkTextFiles();
+    const { files } = await this.walkTextFiles(noteSkipped);
     // Basename lookup for Obsidian embeds: `![[pic.png]]` resolves
     // by filename across the whole library, not relative to the
     // note's directory.
     const imageByName = new Map<string, string[]>();
-    const allFiles = await this.walkAllFiles();
+    const allFiles = await this.walkAllFiles(noteSkipped);
     for (const file of allFiles) {
+      // Archived images must not resolve active-note embeds: an active
+      // note using ![[pic.png]] after the image was archived is a
+      // broken ref (read_file agrees), not an 'ok' to archive/pic.png.
+      if (file.relPath.toLowerCase().startsWith('archive/')) {
+        continue;
+      }
       const ext = path.extname(file.relPath).toLowerCase();
       if (!IMAGE_EXTENSIONS.has(ext)) {
         continue;
       }
-      const list = imageByName.get(path.basename(file.relPath)) ?? [];
+      const key = canonicalRelPath(path.basename(file.relPath));
+      const list = imageByName.get(key) ?? [];
       list.push(file.relPath);
-      imageByName.set(path.basename(file.relPath), list);
+      imageByName.set(key, list);
     }
     for (const file of files) {
       if (file.size === 0) {
         emptyFiles.push(file.relPath);
         continue;
       }
+      const ext = path.extname(file.relPath).toLowerCase();
+      const isMarkdown = MARKDOWN_EXTENSIONS.has(ext);
+      const markSkipped = (reason: string): void => {
+        if (isMarkdown) {
+          scanIncomplete = true;
+          skippedNotes.push({ file: file.relPath, reason });
+        }
+      };
       // Dataless cloud files (macOS): never read — a read would
       // trigger a cloud download. They carry no hash (the index
       // never read them either), so there is nothing to check.
       if (file.dataless) {
+        markSkipped('dataless');
         continue;
       }
       // Files over the content cap are never read here either.
       if (file.size > maxBytes) {
+        markSkipped('oversize');
         continue;
       }
-      const ext = path.extname(file.relPath).toLowerCase();
-      const isMarkdown = MARKDOWN_EXTENSIONS.has(ext);
       const indexEntry = indexReady ? this.data.files[file.relPath] : undefined;
       let data: Buffer | null = null;
       let hash: string | null = null;
@@ -2302,6 +2407,7 @@ export class LocalSearchIndex implements SearchIndex {
         try {
           data = await this.backend.readFile(file.relPath);
         } catch {
+          markSkipped('read error');
           continue;
         }
         hash = sha256Hex(data);
@@ -2312,13 +2418,22 @@ export class LocalSearchIndex implements SearchIndex {
         try {
           data = await this.backend.readFile(file.relPath);
         } catch {
+          markSkipped('read error');
           continue;
         }
-        hash = sha256Hex(data);
+        // Extensionless binaries are not text: do not hash them into
+        // duplicateGroups (addFileToIndex already gates on
+        // looksLikeText; the index-hash path above can only carry a
+        // hash for a file the index judged text).
+        if (ext === '' && !looksLikeText(data)) {
+          hash = null;
+        } else {
+          hash = sha256Hex(data);
+        }
       }
       if (hash !== null && !file.nameOnly) {
         const group = byHash.get(hash) ?? [];
-        group.push(file.relPath);
+        group.push({ relPath: file.relPath, mtimeMs: file.mtimeMs });
         byHash.set(hash, group);
       }
       let markdownText: string | null = null;
@@ -2326,14 +2441,26 @@ export class LocalSearchIndex implements SearchIndex {
         markdownText = data.toString('utf8');
         const text = markdownText;
         for (const ref of scanMarkdownImages(text)) {
-          const resolved = await this.resolveImageRef(file.relPath, ref, imageByName);
+          let resolved:
+            | { status: 'ok'; path: string }
+            | { status: 'ambiguous'; candidates: string[] }
+            | { status: 'broken' };
+          try {
+            resolved = await this.resolveImageRef(file.relPath, ref, imageByName);
+          } catch {
+            // A backend failure (not a bad ref) must not abort the
+            // whole scan: mark the note incomplete and stop its
+            // remaining refs.
+            markSkipped('image ref error');
+            break;
+          }
           if (resolved.status === 'ok') {
-            referenced.add(resolved.path);
+            referenced.add(canonicalRelPath(resolved.path));
           } else if (resolved.status === 'ambiguous') {
             // Several files share the name: not broken, and none of
             // them is an orphan.
             for (const candidate of resolved.candidates) {
-              referenced.add(candidate);
+              referenced.add(canonicalRelPath(candidate));
             }
           } else {
             brokenImageRefs.push({ file: file.relPath, src: ref.src });
@@ -2342,21 +2469,18 @@ export class LocalSearchIndex implements SearchIndex {
       }
       if (underScope(file.relPath)) {
         let fileTags: string[] = [];
-        if (indexReady) {
-          // Use the indexed tags only when the entry is fresh; a new or
-          // edited file (diagnostics does not refresh the index first)
-          // falls back to the text already read for image refs.
-          if (
-            indexEntry !== undefined &&
-            indexEntry.mtimeMs === file.mtimeMs &&
-            indexEntry.size === file.size
-          ) {
-            fileTags = indexEntry.tags;
-          } else if (markdownText !== null) {
-            fileTags = extractTags(markdownText);
-          }
-        } else if (markdownText !== null) {
+        if (isMarkdown && markdownText !== null) {
+          // Markdown was just read fresh for image refs: always
+          // extract from that text (the index entry can miss a
+          // same-size edit within coarse mtime granularity).
           fileTags = extractTags(markdownText);
+        } else if (
+          indexReady &&
+          indexEntry !== undefined &&
+          indexEntry.mtimeMs === file.mtimeMs &&
+          indexEntry.size === file.size
+        ) {
+          fileTags = indexEntry.tags;
         }
         for (const tag of fileTags) {
           tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
@@ -2364,23 +2488,97 @@ export class LocalSearchIndex implements SearchIndex {
       }
       await LocalSearchIndex.yieldLoop();
     }
-    const duplicateGroups = [...byHash.values()].filter((g) => g.length > 1);
+    const duplicateGroups = [...byHash.values()]
+      .filter((g) => g.length > 1)
+      .map((g) =>
+        [...g]
+          .sort(
+            (a, b) =>
+              a.mtimeMs - b.mtimeMs ||
+              (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0),
+          )
+          .map((e) => e.relPath),
+      );
+    // [Issue 1 & Issue 6] Scan archived Markdown notes so their image references
+    // (both at their current archived position and at their original pre-archive
+    // position) count into `referenced` and are never flagged as orphans.
+    for (const file of allFiles) {
+      const lowerRel = file.relPath.toLowerCase();
+      if (!lowerRel.startsWith('archive/')) {
+        continue;
+      }
+      const ext = path.extname(file.relPath).toLowerCase();
+      if (!MARKDOWN_EXTENSIONS.has(ext)) {
+        continue;
+      }
+      try {
+        const st = await this.backend.stat(file.relPath);
+        if (st === null) {
+          scanIncomplete = true;
+          skippedNotes.push({ file: file.relPath, reason: 'stat failed' });
+          continue;
+        }
+        if (st.size === 0) {
+          continue;
+        }
+        if (st.size > maxBytes) {
+          scanIncomplete = true;
+          skippedNotes.push({ file: file.relPath, reason: 'oversize' });
+          continue;
+        }
+        if (await this.isDatalessFile(file.relPath, st.size)) {
+          scanIncomplete = true;
+          skippedNotes.push({ file: file.relPath, reason: 'dataless' });
+          continue;
+        }
+        const data = await this.backend.readFile(file.relPath);
+        const text = data.toString('utf8');
+        const origRelPath = file.relPath.slice('archive/'.length);
+        for (const ref of scanMarkdownImages(text)) {
+          for (const baseRel of [file.relPath, origRelPath]) {
+            const resolved = await this.resolveImageRef(baseRel, ref, imageByName);
+            if (resolved.status === 'ok') {
+              referenced.add(canonicalRelPath(resolved.path));
+            } else if (resolved.status === 'ambiguous') {
+              for (const candidate of resolved.candidates) {
+                referenced.add(canonicalRelPath(candidate));
+              }
+            }
+          }
+        }
+      } catch {
+        scanIncomplete = true;
+        skippedNotes.push({ file: file.relPath, reason: 'read error' });
+        continue;
+      }
+      await LocalSearchIndex.yieldLoop();
+    }
     // Orphan candidates: image files that no note references, older
     // than the minimum retention. Candidates only.
     const orphanCandidates: string[] = [];
     const now = Date.now();
     for (const file of allFiles) {
+      if (file.relPath.toLowerCase().startsWith('archive/')) {
+        continue;
+      }
       const ext = path.extname(file.relPath).toLowerCase();
       if (!IMAGE_EXTENSIONS.has(ext)) {
         continue;
       }
-      if (referenced.has(file.relPath)) {
+      if (referenced.has(canonicalRelPath(file.relPath))) {
         continue;
       }
-      if (now - file.mtimeMs < ORPHAN_MIN_RETENTION_MS) {
+      if (!(now - file.mtimeMs >= ORPHAN_MIN_RETENTION_MS)) {
         continue;
       }
       orphanCandidates.push(file.relPath);
+    }
+    // [Issue 2] A skipped note may reference any image in the library, so a
+    // partial scan can never prove an image is an orphan. When the scan is
+    // incomplete, withhold the whole orphan list rather than risk a false
+    // positive that Part 3 cleanup would delete.
+    if (scanIncomplete) {
+      orphanCandidates.length = 0;
     }
     const tags = [...tagCounts.entries()]
       .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
@@ -2395,9 +2593,25 @@ export class LocalSearchIndex implements SearchIndex {
         brokenImageRefs: brokenImageRefs.filter((r) => under(r.file)),
         orphanCandidates: orphanCandidates.filter(under),
         tags,
+        scanIncomplete,
+        skippedNotes,
       };
     }
-    return { emptyFiles, duplicateGroups, brokenImageRefs, orphanCandidates, tags };
+    return {
+      emptyFiles,
+      duplicateGroups,
+      brokenImageRefs,
+      orphanCandidates,
+      tags,
+      scanIncomplete,
+      skippedNotes,
+    };
+  }
+
+  /** True only when the path exists and is a regular file (not a directory). */
+  private async isRegularFile(relPath: string): Promise<boolean> {
+    const st = await this.backend.stat(relPath);
+    return st !== null && !st.isDirectory;
   }
 
   /**
@@ -2421,15 +2635,33 @@ export class LocalSearchIndex implements SearchIndex {
     | { status: 'ambiguous'; candidates: string[] }
     | { status: 'broken' }
   > {
+    if (ref.src.includes('\0')) {
+      return { status: 'broken' };
+    }
     // Normalize backslashes too, not just `path.sep`: a note
     // synced from Windows carries `folder\pic.png`, and on
     // macOS/Linux `path.sep` is `/`, so `split(path.sep)` would
     // leave the `\` intact and `path.posix.normalize` would not
     // recognize `..\` — the escape check below would be bypassed
     // and a legitimate Windows ref would fail to resolve.
-    const src = ref.src.replace(/\\/g, '/');
+    // scanMarkdownImages already percent-decoded this ref once, so do
+    // NOT decode again here: a second decode turns `a%20.png` (a real
+    // filename) into `a .png` and breaks the ref. It also already
+    // stripped raw `#`/`?` for Obsidian refs, so there is no Obsidian
+    // re-strip here either: a decoded `#` (from `%23`) is a literal
+    // filename character. For non-Obsidian refs, `?` is NOT stripped
+    // up front either — the literal src is resolved first below, and
+    // only if that fails does the non-Obsidian branch fall back to
+    // stripping from the first `?` (so `what?.png` resolves literally
+    // while `assets/q.png?v=2` still resolves to `assets/q.png`).
+    let src = ref.src.replace(/\\/g, '/');
+    // An empty ref, a bare `.`, or a trailing-slash path is a directory
+    // (or nothing), never an image — reject before any branch probes it.
+    if (src === '' || src === '.' || src.endsWith('/')) {
+      return { status: 'broken' };
+    }
     if (ref.kind === 'obsidian' && !src.includes('/')) {
-      const candidates = imageByName.get(src) ?? [];
+      const candidates = imageByName.get(canonicalRelPath(src)) ?? [];
       if (candidates.length === 1) {
         return { status: 'ok', path: candidates[0] as string };
       }
@@ -2442,14 +2674,14 @@ export class LocalSearchIndex implements SearchIndex {
       // Vault-root-relative first (a leading `/` is Obsidian's
       // absolute-in-vault form, so it is stripped, not kept).
       const vaultPath = path.posix.normalize(src.replace(/^\/+/, ''));
-      // A ref that escapes the library (`![[../../outside.png]]`)
-      // must not be probed: it would leak whether a file exists
-      // outside the root (the content is blocked downstream, but
-      // the existence signal alone is a side channel).
-      if (vaultPath === '..' || vaultPath.startsWith('../')) {
-        return { status: 'broken' };
-      }
-      if (await this.backend.exists(vaultPath)) {
+      // A ref that escapes the library at the vault level
+      // (`![[../../outside.png]]`) must not be probed at the vault
+      // root (the existence signal alone is a side channel) — but it
+      // may still resolve note-relative (`![[../pic.png]]` from
+      // notes/deep/ means notes/pic.png), so fall through to the
+      // note-relative branch instead of returning 'broken' here.
+      const vaultEscapes = vaultPath === '..' || vaultPath.startsWith('../');
+      if (!vaultEscapes && (await this.isRegularFile(vaultPath))) {
         return { status: 'ok', path: vaultPath };
       }
       // Then note-relative.
@@ -2459,14 +2691,14 @@ export class LocalSearchIndex implements SearchIndex {
       if (noteRelative === '..' || noteRelative.startsWith('../')) {
         return { status: 'broken' };
       }
-      if (await this.backend.exists(noteRelative)) {
+      if (await this.isRegularFile(noteRelative)) {
         return { status: 'ok', path: noteRelative };
       }
       // Then path-suffix: the vault path ending in the given path.
       const suffixMatches: string[] = [];
       for (const candidates of imageByName.values()) {
         for (const candidate of candidates) {
-          if (candidate.endsWith(`/${vaultPath}`)) {
+          if (canonicalRelPath(candidate).endsWith(`/${canonicalRelPath(vaultPath)}`)) {
             suffixMatches.push(candidate);
           }
         }
@@ -2479,16 +2711,48 @@ export class LocalSearchIndex implements SearchIndex {
       }
       return { status: 'broken' };
     }
-    const resolved = path.posix.normalize(
-      path.posix.join(path.posix.dirname(noteRelPath), src),
-    );
+    let resolved: string;
+    if (src.startsWith('/')) {
+      // A leading slash is library-root-relative (a note writing
+      // `![](/assets/pic.png)` means the vault-root file), not
+      // relative to the note's directory.
+      resolved = path.posix.normalize(src.replace(/^\/+/, ''));
+    } else {
+      resolved = path.posix.normalize(
+        path.posix.join(path.posix.dirname(noteRelPath), src),
+      );
+    }
     // Same escape guard as the Obsidian branch above: a ref that
     // resolves outside the library is broken, not probed.
     if (resolved === '..' || resolved.startsWith('../')) {
       return { status: 'broken' };
     }
-    const exists = await this.backend.exists(resolved);
-    return exists ? { status: 'ok', path: resolved } : { status: 'broken' };
+    if (await this.isRegularFile(resolved)) {
+      return { status: 'ok', path: resolved };
+    }
+    // Fallback for non-Obsidian refs carrying a query suffix
+    // (`assets/q.png?v=2`): the literal path above does not exist, so
+    // strip from the first `?` and try once more. This fallback runs
+    // ONLY when isRegularFile returned false (file absent). If
+    // isRegularFile THREW (a stat error), the throw propagates and is
+    // NOT retried here — scanDiagnostics turns it into scanIncomplete.
+    const queryAt = src.indexOf('?');
+    if (queryAt !== -1) {
+      const strippedSrc = src.slice(0, queryAt);
+      if (strippedSrc !== '' && strippedSrc !== '.' && !strippedSrc.endsWith('/')) {
+        const fallbackResolved = strippedSrc.startsWith('/')
+          ? path.posix.normalize(strippedSrc.replace(/^\/+/, ''))
+          : path.posix.normalize(
+              path.posix.join(path.posix.dirname(noteRelPath), strippedSrc),
+            );
+        if (fallbackResolved !== '..' && !fallbackResolved.startsWith('../')) {
+          if (await this.isRegularFile(fallbackResolved)) {
+            return { status: 'ok', path: fallbackResolved };
+          }
+        }
+      }
+    }
+    return { status: 'broken' };
   }
 
   /**
@@ -2599,16 +2863,17 @@ export class LocalSearchIndex implements SearchIndex {
           continue;
         }
         const base = path.basename(relPath);
-        const list = imageByName.get(base) ?? [];
+        const key = canonicalRelPath(base);
+        const list = imageByName.get(key) ?? [];
         list.push(relPath);
-        imageByName.set(base, list);
+        imageByName.set(key, list);
       }
     }
     return this.resolveImageRef(noteRelPath, ref, imageByName);
   }
 
   /** Walk every file (any type) for orphan detection. Same symlink guards as the text walk: no escapes, no loops. */
-  private async walkAllFiles(): Promise<Array<{ relPath: string; mtimeMs: number }>> {
+  private async walkAllFiles(onSkip?: (file: string, reason: string) => void): Promise<Array<{ relPath: string; mtimeMs: number }>> {
     const out: Array<{ relPath: string; mtimeMs: number }> = [];
     let rootRealDir = this.rootRealDir;
     try {
@@ -2618,16 +2883,25 @@ export class LocalSearchIndex implements SearchIndex {
     }
     const visited = new Set<string>([rootRealDir]);
     const queue: string[] = [''];
+    const pendingSymlinkDirs: Array<{ relPath: string; real: string }> = [];
     while (queue.length > 0) {
       const current = queue.shift() as string;
       let entries;
       try {
         entries = await this.backend.listDirectory(current);
       } catch {
+        onSkip?.(current === '' ? '.' : current, 'list error');
         continue;
       }
       for (const entry of entries) {
-        if (entry.name.startsWith('.mdtmp-') || isPlaceholderFile(entry.relPath)) {
+        if (isPlaceholderFile(entry.relPath)) {
+          const stripped = entry.relPath.replace(/\.[^.]+$/, '');
+          if (MARKDOWN_EXTENSIONS.has(path.extname(stripped).toLowerCase())) {
+            onSkip?.(entry.relPath, 'placeholder');
+          }
+          continue;
+        }
+        if (entry.name.startsWith('.')) {
           continue;
         }
         // Symlink guard: only a symlink needs the realpath +
@@ -2641,6 +2915,7 @@ export class LocalSearchIndex implements SearchIndex {
               continue;
             }
           } catch {
+            onSkip?.(entry.relPath, 'symlink target unreadable');
             continue;
           }
         }
@@ -2650,10 +2925,16 @@ export class LocalSearchIndex implements SearchIndex {
             try {
               real = await fs.realpath(path.join(this.rootDir, entry.relPath));
             } catch {
+              onSkip?.(entry.relPath, 'realpath failed');
               continue;
             }
           }
-          if (!visited.has(real)) {
+          if (entry.isSymlink) {
+            // Defer symlink directories: a real directory to the same
+            // target, listed in the same parent, must win the visited
+            // race so walked files carry the real relPath.
+            pendingSymlinkDirs.push({ relPath: entry.relPath, real });
+          } else if (!visited.has(real)) {
             visited.add(real);
             queue.push(entry.relPath);
           }
@@ -2664,6 +2945,13 @@ export class LocalSearchIndex implements SearchIndex {
           mtimeMs: new Date(entry.modifiedAt).getTime(),
         });
       }
+      for (const pending of pendingSymlinkDirs) {
+        if (!visited.has(pending.real)) {
+          visited.add(pending.real);
+          queue.push(pending.relPath);
+        }
+      }
+      pendingSymlinkDirs.length = 0;
       await LocalSearchIndex.yieldLoop();
     }
     return out;

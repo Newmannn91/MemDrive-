@@ -130,10 +130,10 @@ async function launchViewer(command, args, absolutePath, platform) {
     // re-parses the line; cmd.exe does.) Refuse instead of launching.
     // NOTE: this is a refusal, not a new launch mechanism — switching
     // away from cmd entirely is a follow-up, not this round.
-    if (platform === 'win32' && /[&|<>^%]/.test(absolutePath)) {
+    if (platform === 'win32' && /[\r\n&|<>^%]/.test(absolutePath)) {
         return {
             ok: false,
-            reason: `Refusing to open a path containing shell metacharacters (& | < > ^ %) on Windows: ${absolutePath}`,
+            reason: `Refusing to open a path containing shell metacharacters (& | < > ^ % \\r \\n) on Windows: ${absolutePath}`,
         };
     }
     return new Promise((resolve) => {

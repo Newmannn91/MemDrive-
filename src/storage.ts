@@ -12,12 +12,14 @@
  * root (a symlink inside the root pointing outside it) instead of
  * reading its content.
  */
+import crypto from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { atomicWrite } from './atomic.js';
 import { SEARCH_CONTENT_MAX_BYTES } from './config.js';
-import { MemDriveError } from './errors.js';
+import { MemDriveError, NotFoundError } from './errors.js';
 import { assertInsideRealRoot, isInside } from './sandbox.js';
 
 export interface DirEntry {
@@ -40,6 +42,10 @@ export interface StorageBackend {
 
   /** Read a whole file as bytes. */
   readFile(relPath: string): Promise<Buffer>;
+
+  /** SHA-256 hex digest of a file, computed by streaming it in
+      chunks (never loads the whole file into memory). */
+  hashFile(relPath: string): Promise<string>;
 
   /** Metadata for a path, or null when it does not exist. */
   stat(
@@ -67,11 +73,23 @@ export interface StorageBackend {
   ensureDir(relDir: string): Promise<void>;
 
   /**
+   * Move a file from `srcRel` to `destRel` (same-filesystem rename),
+   * creating parent directories for `destRel` as needed. Rejects when
+   * `srcRel` does not exist.
+   */
+  moveFile(srcRel: string, destRel: string): Promise<void>;
+
+  /**
    * Recursively walk `relDir`, returning root-relative paths of files whose
    * name or (for small text files) content contains `keyword`
    * (case-insensitive substring). Implementations may cap the result count.
    */
-  search(keyword: string, relDir: string, maxResults: number): Promise<string[]>;
+  search(
+    keyword: string,
+    relDir: string,
+    maxResults: number,
+    fileTypes?: readonly string[],
+  ): Promise<string[]>;
 }
 
 /**
@@ -131,6 +149,15 @@ export class LocalStorageBackend implements StorageBackend {
     return fs.readFile(this.absolute(relPath));
   }
 
+  public async hashFile(relPath: string): Promise<string> {
+    const hash = crypto.createHash('sha256');
+    const stream = createReadStream(this.absolute(relPath));
+    for await (const chunk of stream) {
+      hash.update(chunk);
+    }
+    return hash.digest('hex');
+  }
+
   public async stat(
     relPath: string,
   ): Promise<{
@@ -148,7 +175,7 @@ export class LocalStorageBackend implements StorageBackend {
         blocks: st.blocks,
       };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') {
         return null;
       }
       throw error;
@@ -178,6 +205,21 @@ export class LocalStorageBackend implements StorageBackend {
         const handle = await fs.open(target, 'wx');
         try {
           await handle.writeFile(data);
+          try {
+            await handle.sync();
+          } catch (error) {
+            // Filesystems without fsync support (some FUSE / network
+            // mounts) throw EINVAL / ENOTSUP / EOPNOTSUPP from sync()
+            // after the data is already written; failing the call here
+            // would leave the file on disk and turn a retry into
+            // ALREADY_EXISTS. The write + close path already pushed
+            // the data through, which is sufficient durability for a
+            // local note store. Any other error still throws.
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP') {
+              throw error;
+            }
+          }
         } finally {
           await handle.close();
         }
@@ -194,7 +236,31 @@ export class LocalStorageBackend implements StorageBackend {
     }
     if (mode === 'append') {
       const existed = await this.exists(relPath);
-      await fs.appendFile(target, data);
+      const handle = await fs.open(target, 'a');
+      try {
+        const st = await handle.stat();
+        if (!(st.mode & 0o200)) {
+          throw new MemDriveError('READ_ONLY', `File is read-only: ${relPath}`);
+        }
+        await handle.writeFile(data);
+        try {
+          await handle.sync();
+        } catch (error) {
+          // Filesystems without fsync support (some FUSE / network
+          // mounts) throw EINVAL / ENOTSUP / EOPNOTSUPP from sync()
+          // after the data is already written; failing the call here
+          // would leave the file on disk and turn a retry into
+          // ALREADY_EXISTS. The write + close path already pushed
+          // the data through, which is sufficient durability for a
+          // local note store. Any other error still throws.
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP') {
+            throw error;
+          }
+        }
+      } finally {
+        await handle.close();
+      }
       return { created: !existed };
     }
     // Atomic replace via the shared helper (resolves symlinks with
@@ -213,13 +279,84 @@ export class LocalStorageBackend implements StorageBackend {
     await fs.mkdir(this.absolute(relDir), { recursive: true });
   }
 
+  public async moveFile(srcRel: string, destRel: string): Promise<void> {
+    const srcAbs = this.absolute(srcRel);
+    const destAbs = this.absolute(destRel);
+    let rootRealDir: string;
+    try {
+      rootRealDir = await fs.realpath(this.rootDir);
+    } catch {
+      rootRealDir = this.rootDir;
+    }
+    await assertInsideRealRoot(rootRealDir, srcAbs);
+    await assertInsideRealRoot(rootRealDir, destAbs);
+    try {
+      await fs.mkdir(path.dirname(destAbs), { recursive: true });
+      try {
+        await fs.link(srcAbs, destAbs);
+      } catch (linkError) {
+        const linkCode = (linkError as NodeJS.ErrnoException).code;
+        if (
+          linkCode === 'EPERM' ||
+          linkCode === 'ENOSYS' ||
+          linkCode === 'EOPNOTSUPP' ||
+          linkCode === 'ENOTSUP' ||
+          linkCode === 'EXDEV' ||
+          linkCode === 'EMLINK'
+        ) {
+          try {
+            await fs.copyFile(srcAbs, destAbs, fs.constants.COPYFILE_EXCL);
+          } catch (copyError) {
+            if ((copyError as NodeJS.ErrnoException).code !== 'EEXIST') {
+              await fs.unlink(destAbs).catch(() => undefined); // only clean up a partial target we created
+            }
+            throw copyError;
+          }
+        } else {
+          throw linkError;
+        }
+      }
+      try {
+        await fs.unlink(srcAbs);
+      } catch (e) {
+        await fs.unlink(destAbs).catch(() => undefined); // rollback: delete the created target, source file remains
+        throw e;
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        throw new MemDriveError(
+          'ALREADY_EXISTS',
+          `Destination already exists: ${destRel}. Refusing to overwrite.`,
+        );
+      }
+      if (code === 'ENOENT') {
+        throw new NotFoundError(`File not found: ${srcRel}`);
+      }
+      throw error;
+    }
+  }
+
   public async search(
     keyword: string,
     relDir: string,
     maxResults: number,
+    fileTypes?: readonly string[],
   ): Promise<string[]> {
     const needle = keyword.toLowerCase();
+    const wantedExts =
+      fileTypes !== undefined && fileTypes.length > 0
+        ? new Set(
+            fileTypes.map((e) => (e.startsWith('.') ? e.toLowerCase() : `.${e.toLowerCase()}`)),
+          )
+        : null;
     const hits: string[] = [];
+    // [Issue 4 & Issue 6] Refuse direct scan inside top-level archive/ so its
+    // behavior matches the indexed search path.
+    const lowerRelDir = relDir.toLowerCase();
+    if (lowerRelDir === 'archive' || lowerRelDir.startsWith('archive/')) {
+      return hits;
+    }
     // The search root was sandbox-checked by the caller, but the walk
     // discovers entries the caller never validated. A symlink inside
     // the root may point at a file outside it, and fs.stat follows
@@ -232,6 +369,23 @@ export class LocalStorageBackend implements StorageBackend {
       rootRealDir = await fs.realpath(this.rootDir);
     } catch {
       rootRealDir = this.rootDir;
+    }
+    // Resolve the archive dir realpath (if it exists) so symlinks into
+    // archive/ are excluded, not just the literal top-level name.
+    let archiveReal: string | null = null;
+    try {
+      archiveReal = await fs.realpath(this.absolute('archive'));
+    } catch {
+      archiveReal = null;
+    }
+    // When a relDir scope is given, confine the walk to its realpath.
+    let scopeReal: string | null = null;
+    if (relDir !== '') {
+      try {
+        scopeReal = await fs.realpath(this.absolute(relDir));
+      } catch {
+        scopeReal = null;
+      }
     }
     const visitedDirs = new Set<string>([rootRealDir]);
     const queue: string[] = [relDir];
@@ -253,15 +407,28 @@ export class LocalStorageBackend implements StorageBackend {
           if (!isInside(rootRealDir, real)) {
             continue;
           }
+          if (archiveReal !== null && isInside(archiveReal, real)) {
+            continue;
+          }
+          if (scopeReal !== null && !isInside(scopeReal, real)) {
+            continue;
+          }
         } catch {
           // Vanished or broken link: nothing readable here.
           continue;
         }
         if (entry.type === 'directory') {
+          // [Issue 6] Case-insensitive check for top-level archive/
+          if (current === '' && entry.name.toLowerCase() === 'archive') {
+            continue;
+          }
           if (!visitedDirs.has(real)) {
             visitedDirs.add(real);
             queue.push(entry.relPath);
           }
+          continue;
+        }
+        if (wantedExts !== null && !wantedExts.has(path.extname(entry.name).toLowerCase())) {
           continue;
         }
         if (entry.name.toLowerCase().includes(needle)) {

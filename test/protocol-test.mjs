@@ -9,7 +9,7 @@
  * Exit code 0 = every check passed.
  */
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -258,10 +258,19 @@ async function main() {
   try {
     await client.connect(transport);
 
-    await check('initialize + tools/list exposes exactly the 6 tools', async () => {
+    await check('initialize + tools/list exposes exactly the 11 tools', async () => {
       const listed = await client.listTools();
       const names = listed.tools.map((t) => t.name).sort();
-      assert.deepEqual(names, ['list_directory', 'open_containing_folder', 'open_image', 'read_file', 'save_file', 'search_files']);
+      assert.deepEqual(names, ['apply_plan', 'archive_file', 'edit_tags', 'list_directory', 'open_containing_folder', 'open_image', 'plan_cleanup', 'read_file', 'restore_file', 'save_file', 'search_files']);
+    });
+
+    await check('server version matches package.json and server.json', async () => {
+      const pkg = JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8'));
+      const srv = JSON.parse(await fs.readFile(new URL('../server.json', import.meta.url), 'utf8'));
+      const serverVersion = client.getServerVersion()?.version;
+      assert.equal(serverVersion, pkg.version);
+      assert.equal(serverVersion, srv.version);
+      assert.equal(serverVersion, srv.packages?.[0]?.version);
     });
 
     await check('list_directory on empty root', async () => {
@@ -1000,7 +1009,7 @@ async function main() {
       const read = await call('read_file', { path: 'notes/obsidian.md' });
       assert.equal(read.isError, undefined, textOf(read));
       assert.doesNotMatch(textOf(read), /Skipped image/);
-      assert.equal(imagesOf(read).length, 2, 'both Obsidian embeds must resolve to images');
+      assert.equal(imagesOf(read).length, 1, 'duplicate embeds of the same image are deduped to one block');
       // .markdown is Markdown too: inline refs resolve.
       const savedMd = await call('save_file', {
         path: 'notes/md-ext.markdown',
@@ -2606,7 +2615,9 @@ async function main() {
       assert.throws(() => validateCrossPlatformSegments('notes/bad '), /dot or space/);
       assert.throws(() => validateCrossPlatformSegments('//server/share/x.md'), /UNC/);
       validateCrossPlatformSegments('notes/normal-file.md');
-      validateCrossPlatformSegments('C:/Users/x/memdrive/notes/a.md');
+      // B5 (0.9.0 fix): a leading drive letter is rejected — the only caller
+      // passes root-relative paths, so `C:` can never be legitimate here.
+      assert.throws(() => validateCrossPlatformSegments('C:/Users/x/memdrive/notes/a.md'), /alternate data stream/);
       const res = await call('save_file', { path: 'notes/NUL.md', content: 'x', mode: 'new' });
       assert.equal(res.isError, true);
       assert.match(textOf(res), /reserved device/i);
@@ -2761,6 +2772,106 @@ async function main() {
         ),
       );
       delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    await check('0.9.0 storage (class): moveFile refuses to overwrite and keeps the original file', async () => {
+      const libDir = path.join(scratch, 'movefile-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      const backend = new LocalStorageBackend(libDir);
+      await fs.writeFile(path.join(libDir, 'a.txt'), 'first');
+      await fs.writeFile(path.join(libDir, 'b.txt'), 'second');
+      await backend.moveFile('a.txt', 'dest.txt');
+      assert.equal(await fs.readFile(path.join(libDir, 'dest.txt'), 'utf8'), 'first');
+      assert.equal(await backend.exists('a.txt'), false);
+      await assert.rejects(
+        () => backend.moveFile('b.txt', 'dest.txt'),
+        (err) => err.name === 'MemDriveError' && err.code === 'ALREADY_EXISTS',
+      );
+      assert.equal(await fs.readFile(path.join(libDir, 'dest.txt'), 'utf8'), 'first');
+      assert.equal(await fs.readFile(path.join(libDir, 'b.txt'), 'utf8'), 'second');
+    });
+
+    await check('0.9.0 storage (class): moveFile rolls back the target when unlink of the source fails', async () => {
+      if (process.platform !== 'linux') {
+        return;
+      }
+      const libDir = path.join(scratch, 'movefile-rollback-lib');
+      const lockedAbs = path.join(libDir, 'locked');
+      await fs.mkdir(lockedAbs, { recursive: true });
+      await fs.mkdir(path.join(libDir, 'out'), { recursive: true });
+      await fs.writeFile(path.join(lockedAbs, 'src.txt'), 'original');
+      const backend = new LocalStorageBackend(libDir);
+      // link creates the hard link in the writable 'out' dir, then unlink of the source fails because 'locked' is bind-mounted read-only, so the rollback must delete the target.
+      try {
+        execFileSync('mount', ['--bind', lockedAbs, lockedAbs]);
+        execFileSync('mount', ['-o', 'remount,ro,bind', lockedAbs]);
+      } catch {
+        try { execFileSync('umount', [lockedAbs]); } catch {}
+        return;
+      }
+      try {
+        await assert.rejects(
+          () => backend.moveFile('locked/src.txt', 'out/dest.txt'),
+          (err) => err.code === 'EROFS',
+        );
+        assert.equal(await fs.readFile(path.join(libDir, 'locked', 'src.txt'), 'utf8'), 'original');
+        assert.equal(await backend.exists('out/dest.txt'), false);
+      } finally {
+        try {
+          execFileSync('umount', [lockedAbs]);
+        } catch {}
+      }
+    });
+
+    await check('0.9.0 storage (class): moveFile does not delete an existing target when the copyFile fallback fails with EEXIST', async () => {
+      const libDir = path.join(scratch, 'movefile-eexist-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      await fs.writeFile(path.join(libDir, 'src.txt'), 'source');
+      await fs.writeFile(path.join(libDir, 'dest.txt'), 'keep-me');
+      const backend = new LocalStorageBackend(libDir);
+      const origLink = fs.link;
+      fs.link = async () => {
+        const e = new Error('cross-device link not permitted');
+        e.code = 'EXDEV';
+        throw e;
+      };
+      try {
+        await assert.rejects(
+          () => backend.moveFile('src.txt', 'dest.txt'),
+          (err) => err.name === 'MemDriveError' && err.code === 'ALREADY_EXISTS',
+        );
+        assert.equal(await fs.readFile(path.join(libDir, 'dest.txt'), 'utf8'), 'keep-me');
+        assert.equal(await fs.readFile(path.join(libDir, 'src.txt'), 'utf8'), 'source');
+      } finally {
+        fs.link = origLink;
+      }
+    });
+
+    await check('0.9.0 storage (class): moveFile rolls back the target when unlink of the source fails (no root required)', async () => {
+      const libDir = path.join(scratch, 'movefile-rollback-noroot-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      await fs.writeFile(path.join(libDir, 'src.txt'), 'original');
+      const backend = new LocalStorageBackend(libDir);
+      const srcAbs = path.join(libDir, 'src.txt');
+      const origUnlink = fs.unlink;
+      fs.unlink = async (p) => {
+        if (p === srcAbs) {
+          const e = new Error('read-only file system');
+          e.code = 'EROFS';
+          throw e;
+        }
+        return origUnlink(p);
+      };
+      try {
+        await assert.rejects(
+          () => backend.moveFile('src.txt', 'dest.txt'),
+          (err) => err.code === 'EROFS',
+        );
+        assert.equal(await fs.readFile(path.join(libDir, 'src.txt'), 'utf8'), 'original');
+        assert.equal(await backend.exists('dest.txt'), false);
+      } finally {
+        fs.unlink = origUnlink;
+      }
     });
 
     await check('0.8.4 index (class): diagnostics tags match when index is ready', async () => {
@@ -3099,6 +3210,39 @@ async function main() {
       delete process.env['MEMDRIVE_CACHE_DIR'];
     });
 
+    await check('0.9.0 index (class): double-encoded image refs resolve, percent-encoded ? in filenames is literal (Sonnet final review #1)', async () => {
+      const libDir = path.join(scratch, 'index-double-decode-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-double-decode-cache');
+      const backend = new LocalStorageBackend(libDir);
+      const idx = new LocalSearchIndex(libDir, libDir, backend);
+      // Files whose names contain a literal `%` / `?`: encodeImageSrc
+      // writes them referenced as %2520 / %3F (double-encoded).
+      // `?` is illegal in Windows filenames, so what?.png is only
+      // exercised on non-Windows platforms.
+      const imageNames = ['a%20.png'];
+      if (process.platform !== 'win32') imageNames.push('what?.png');
+      for (const name of imageNames) {
+        await fs.writeFile(path.join(libDir, name), smallPng);
+      }
+      const noteBody = imageNames.map((name) => {
+        const ref = name.replace(/%/g, '%25').replace(/\?/g, '%3F');
+        return `![x](${ref})`;
+      }).join('\n\n');
+      await fs.writeFile(path.join(libDir, 'n.md'), `# N\n\n${noteBody}\n`);
+      // Backdate past the 24h orphan threshold: if either ref were
+      // reported broken, its file would land in orphanCandidates.
+      const old = new Date(Date.now() - 25 * 3600 * 1000);
+      for (const p of imageNames) {
+        await fs.utimes(path.join(libDir, p), old, old);
+      }
+      await idx.buildAll();
+      const diag = await idx.scanDiagnostics();
+      assert.deepEqual(diag.brokenImageRefs, []);
+      assert.deepEqual(diag.orphanCandidates, []);
+      delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
     await check('0.8.0 index (class): diagnostics never reads a dataless cloud file', async () => {
       const libDir = path.join(scratch, 'index-dataless-lib');
       await fs.mkdir(libDir, { recursive: true });
@@ -3126,6 +3270,1303 @@ async function main() {
       assert.deepEqual(diag.brokenImageRefs, []);
       assert.deepEqual(diag.duplicateGroups, []);
       delete process.env['MEMDRIVE_CACHE_DIR'];
+    });
+
+    // [Issue 1]
+    await check('0.9.0 index (class): a zero-block archived note is still read (not treated as dataless on non-macOS)', async () => {
+      const libDir = path.join(scratch, 'index-zero-blocks-lib');
+      await fs.mkdir(path.join(libDir, 'archive'), { recursive: true });
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-zero-blocks-cache');
+      class ZeroBlocksBackend extends LocalStorageBackend {
+        async stat(relPath) {
+          const st = await super.stat(relPath);
+          if (st !== null && relPath === 'archive/zero-blocks.md') {
+            return { ...st, blocks: 0 };
+          }
+          return st;
+        }
+      }
+      try {
+        const backend = new ZeroBlocksBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const imgPath = path.join(libDir, 'assets', 'zb.png');
+        await fs.writeFile(imgPath, 'fake-png');
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        await fs.utimes(imgPath, old, old);
+        await fs.writeFile(path.join(libDir, 'archive', 'zero-blocks.md'), '# Zero blocks\n\n![[zb.png]]\n');
+        await idx.buildAll();
+        const diag = await idx.scanDiagnostics();
+        assert.ok(!diag.orphanCandidates.includes('assets/zb.png'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    // [Issue 2]
+    await check('0.9.0 index (class): an unreadable archived note withholds the whole orphan list', async () => {
+      const libDir = path.join(scratch, 'index-oversize-archive-lib');
+      await fs.mkdir(path.join(libDir, 'archive'), { recursive: true });
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-oversize-archive-cache');
+      try {
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const imgPath = path.join(libDir, 'assets', 'ov.png');
+        await fs.writeFile(imgPath, 'fake-png');
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        await fs.utimes(imgPath, old, old);
+        await fs.writeFile(path.join(libDir, 'archive', 'oversize.md'), '# Oversize archived note\n\n' + 'x'.repeat(1500) + '\n\n![[ov.png]]\n');
+        await idx.buildAll();
+        let diag;
+        process.env['MEMDRIVE_INDEX_MAX_BYTES'] = '1000';
+        try {
+          diag = await idx.scanDiagnostics();
+        } finally {
+          delete process.env['MEMDRIVE_INDEX_MAX_BYTES'];
+        }
+        assert.deepEqual(diag.orphanCandidates, []);
+        assert.equal(diag.scanIncomplete, true);
+        assert.ok(diag.skippedNotes.some((n) => n.file === 'archive/oversize.md'));
+        const { formatDiagnostics } = await import('../dist/tools.js');
+        const report = formatDiagnostics(diag);
+        assert.ok(report.includes('Scan incomplete'));
+        assert.ok(report.includes('archive/oversize.md'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 index (class): an oversize non-Markdown file does not hide the orphan list', async () => {
+      const libDir = path.join(scratch, 'index-oversize-csv-lib');
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-oversize-csv-cache');
+      try {
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const imgPath = path.join(libDir, 'assets', 'orphan2.png');
+        await fs.writeFile(imgPath, 'fake-png');
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        await fs.utimes(imgPath, old, old);
+        await fs.writeFile(path.join(libDir, 'data.csv'), 'x'.repeat(1500));
+        await idx.buildAll();
+        let diag;
+        process.env['MEMDRIVE_INDEX_MAX_BYTES'] = '1000';
+        try {
+          diag = await idx.scanDiagnostics();
+        } finally {
+          delete process.env['MEMDRIVE_INDEX_MAX_BYTES'];
+        }
+        assert.deepEqual(diag.orphanCandidates, ['assets/orphan2.png']);
+        assert.equal(diag.scanIncomplete, false);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 plan_cleanup (protocol): returns a plan ID and preview without modifying files', async () => {
+      const res = await call('plan_cleanup', {});
+      assert.equal(res.isError, undefined);
+      assert.match(textOf(res), /Cleanup plan /);
+    });
+
+    await check('0.9.0 plan (class): duplicate groups keep the earliest-modified file and archive the rest; similar files are not proposed', async () => {
+      const libDir = path.join(scratch, 'index-plan-dup-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-dup-cache');
+      try {
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const { buildCleanupPlan } = await import('../dist/tools.js');
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const now = Date.now();
+        const t3h = new Date(now - 3 * 60 * 60 * 1000);
+        const t2h = new Date(now - 2 * 60 * 60 * 1000);
+        const t1h = new Date(now - 1 * 60 * 60 * 1000);
+        for (const [f, t] of [['a.md', t3h], ['b.md', t2h], ['c.md', t1h]]) {
+          const p = path.join(libDir, f);
+          await fs.writeFile(p, 'duplicate content\n');
+          await fs.utimes(p, t, t);
+        }
+        for (const f of ['x.md', 'y.md']) {
+          const p = path.join(libDir, f);
+          await fs.writeFile(p, 'other duplicate\n');
+          await fs.utimes(p, t3h, t3h);
+        }
+        await fs.writeFile(path.join(libDir, 'd.md'), 'duplicate content!\n');
+        await idx.buildAll();
+        const { plan, preview } = await buildCleanupPlan(ctx);
+        assert.deepEqual(plan.actions.map((a) => a.path).sort(), ['b.md', 'c.md', 'y.md']);
+        for (const a of plan.actions) assert.equal(a.action, 'archive');
+        assert.ok(plan.actions.find((a) => a.path === 'b.md').reason.includes('duplicate of a.md'));
+        assert.ok(plan.actions.find((a) => a.path === 'c.md').reason.includes('duplicate of a.md'));
+        assert.ok(plan.actions.find((a) => a.path === 'y.md').reason.includes('duplicate of x.md'));
+        assert.ok(preview.includes('duplicate of a.md'));
+        assert.ok(preview.includes('duplicate of x.md'));
+        assert.ok(preview.includes('Similar content is not proposed automatically'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 plan (class): orphan images archive, empty files archive, plan JSON matches disk, two runs differ, files unmoved', async () => {
+      const libDir = path.join(scratch, 'index-plan-misc-lib');
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      await fs.mkdir(path.join(libDir, 'notes'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-misc-cache');
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const { default: nodeCrypto } = await import('node:crypto');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+        await fs.writeFile(orphanPath, 'fake-png');
+        await fs.utimes(orphanPath, old, old);
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await fs.writeFile(path.join(libDir, 'notes', 'ref.md'), '# R\n\n![pic][p1]\n\n[p1]: ../assets/kept.png\n');
+        const keptPath = path.join(libDir, 'assets', 'kept.png');
+        await fs.writeFile(keptPath, 'fake-png');
+        await fs.utimes(keptPath, old, old);
+        await fs.writeFile(path.join(libDir, 'notes', 'broken.md'), '# B\n\n![x](missing.png)\n');
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const text = textOf(res);
+        const m1 = text.match(/Cleanup plan (\S+) \(/);
+        assert.ok(m1);
+        const planId = m1[1];
+        const plan = JSON.parse(await fs.readFile(path.join(cacheDir, `plan-${planId}.json`), 'utf8'));
+        assert.deepEqual(plan.actions.map((a) => `${a.action}:${a.path}`).sort(), ['archive:assets/orphan.png', 'archive:empty.txt']);
+        for (const p of ['assets/kept.png', 'notes/broken.md', 'notes/ref.md']) {
+          assert.ok(!plan.actions.some((a) => a.path === p));
+        }
+        for (const jsonAction of plan.actions) {
+          const raw = await fs.readFile(path.join(libDir, jsonAction.path));
+          const expectedSha = nodeCrypto.createHash('sha256').update(raw).digest('hex');
+          assert.equal(jsonAction.sha256, expectedSha);
+          const actualStat = await backend.stat(jsonAction.path);
+          assert.ok(actualStat !== null);
+          assert.equal(jsonAction.mtimeMs, new Date(actualStat.modifiedAt).getTime());
+        }
+        assert.ok(text.includes('Cleanup plan'));
+        assert.ok(text.includes('archive assets/orphan.png'));
+        assert.ok(text.includes('archive empty.txt'));
+        assert.ok(text.includes('Broken image references (1)'));
+        const res2 = await handlePlanCleanup(ctx);
+        const m2 = textOf(res2).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m2);
+        assert.notEqual(m2[1], planId);
+        assert.equal(await fs.readFile(path.join(libDir, 'assets/orphan.png'), 'utf8'), 'fake-png');
+        assert.equal((await fs.stat(path.join(libDir, 'empty.txt'))).size, 0);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 plan (class): dotfiles and files under archive/ are never proposed; empty files are archived not deleted', async () => {
+      const libDir = path.join(scratch, 'index-plan-dotfile-lib');
+      await fs.mkdir(path.join(libDir, '.git'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-dotfile-cache');
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await fs.writeFile(path.join(libDir, '.gitkeep'), '');
+        await fs.writeFile(path.join(libDir, '.git/x'), '');
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const text = textOf(res);
+        const m = text.match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const plan = JSON.parse(await fs.readFile(path.join(cacheDir, `plan-${planId}.json`), 'utf8'));
+        assert.deepEqual(plan.actions.map((a) => `${a.action}:${a.path}`).sort(), ['archive:empty.txt']);
+        assert.ok(!plan.actions.some((a) => a.path.startsWith('.')));
+        assert.ok(!plan.actions.some((a) => a.path.startsWith('archive/')));
+        assert.ok(text.includes('archive empty.txt'));
+        assert.ok(!text.includes('.gitkeep'));
+        assert.ok(!text.includes('.git/x'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 plan (class): files under Archive/ (capital A) are never proposed', async () => {
+      const libDir = path.join(scratch, 'index-plan-archivecase-lib');
+      await fs.mkdir(path.join(libDir, 'Archive'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-archivecase-cache');
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await fs.writeFile(path.join(libDir, 'Archive/old.txt'), '');
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const text = textOf(res);
+        const m = text.match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const plan = JSON.parse(await fs.readFile(path.join(cacheDir, `plan-${planId}.json`), 'utf8'));
+        assert.deepEqual(plan.actions.map((a) => `${a.action}:${a.path}`).sort(), ['archive:empty.txt']);
+        assert.ok(!plan.actions.some((a) => a.path.toLowerCase().startsWith('archive/')));
+        assert.ok(text.includes('archive empty.txt'));
+        assert.ok(!text.includes('Archive/old.txt'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    // Windows cannot create a file whose name contains ':'.
+    if (process.platform !== 'win32') {
+      await check('0.9.0 plan (class): a file whose name cannot be written (colon) is never proposed', async () => {
+        const libDir = path.join(scratch, 'index-plan-colon-lib');
+        await fs.mkdir(libDir, { recursive: true });
+        process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-colon-cache');
+        try {
+          const { resolveIndexCacheDir } = await import('../dist/config.js');
+          const { handlePlanCleanup } = await import('../dist/tools.js');
+          const cacheDir = resolveIndexCacheDir(libDir);
+          const backend = new LocalStorageBackend(libDir);
+          const idx = new LocalSearchIndex(libDir, libDir, backend);
+          const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+          await fs.writeFile(path.join(libDir, 'meeting 10:30.md'), '');
+          await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+          await idx.buildAll();
+          const res = await handlePlanCleanup(ctx);
+          const text = textOf(res);
+          const m = text.match(/Cleanup plan (\S+) \(/);
+          assert.ok(m);
+          const planId = m[1];
+          const plan = JSON.parse(await fs.readFile(path.join(cacheDir, `plan-${planId}.json`), 'utf8'));
+          assert.deepEqual(plan.actions.map((a) => `${a.action}:${a.path}`), ['archive:empty.txt']);
+          assert.ok(!plan.actions.some((a) => a.path === 'meeting 10:30.md'));
+          assert.ok(text.includes('archive empty.txt'));
+          assert.ok(!text.includes('meeting 10:30.md'));
+        } finally {
+          delete process.env['MEMDRIVE_CACHE_DIR'];
+        }
+      });
+    }
+
+    await check('0.9.0 plan (class): a multi-chunk file hashes to the same digest when streamed', async () => {
+      const libDir = path.join(scratch, 'index-plan-bigfile-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      const content = Buffer.alloc(512 * 1024, 0x61);
+      await fs.writeFile(path.join(libDir, 'dup-big-a.txt'), content);
+      await fs.writeFile(path.join(libDir, 'dup-big-b.txt'), content);
+      const sameTime = new Date(Date.now() - 10 * 1000);
+      await fs.utimes(path.join(libDir, 'dup-big-a.txt'), sameTime, sameTime);
+      await fs.utimes(path.join(libDir, 'dup-big-b.txt'), sameTime, sameTime);
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-bigfile-cache');
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const text = textOf(res);
+        const m = text.match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const plan = JSON.parse(await fs.readFile(path.join(cacheDir, `plan-${planId}.json`), 'utf8'));
+        const expectedDigest = createHash('sha256').update(content).digest('hex');
+        assert.equal(plan.actions.length, 1);
+        assert.deepEqual(plan.actions.map((a) => `${a.action}:${a.path}`), ['archive:dup-big-b.txt']);
+        assert.equal(plan.actions[0].sha256, expectedDigest);
+        assert.ok(text.includes('archive dup-big-b.txt'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 plan (class): a plan holds at most 200 actions and the preview says so', async () => {
+      const libDir = path.join(scratch, 'index-plan-limit-lib');
+      await fs.mkdir(libDir, { recursive: true });
+      for (let i = 0; i <= 200; i++) {
+        await fs.writeFile(path.join(libDir, `empty-${String(i).padStart(3, '0')}.txt`), '');
+      }
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-limit-cache');
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const text = textOf(res);
+        const m = text.match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const plan = JSON.parse(await fs.readFile(path.join(cacheDir, `plan-${planId}.json`), 'utf8'));
+        assert.equal(plan.actions.length, 200);
+        assert.ok(text.includes('(200 actions)'));
+        assert.ok(text.includes('Plan limit reached (200 actions)'));
+        assert.ok(!text.includes('- archive empty-200.txt'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 plan (class): the preview says when the orphan scan was withheld', async () => {
+      const libDir = path.join(scratch, 'index-plan-withheld-lib');
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+      await fs.writeFile(orphanPath, 'fake-png');
+      const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+      await fs.utimes(orphanPath, old, old);
+      await fs.writeFile(path.join(libDir, 'big.md'), 'x'.repeat(1500));
+      await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-plan-withheld-cache');
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await idx.buildAll();
+        process.env['MEMDRIVE_INDEX_MAX_BYTES'] = '1000';
+        let res;
+        try {
+          res = await handlePlanCleanup(ctx);
+        } finally {
+          delete process.env['MEMDRIVE_INDEX_MAX_BYTES'];
+        }
+        const text = textOf(res);
+        assert.ok(text.includes('Orphan scan withheld: 1 note(s) could not be read (see diagnostics_only)'));
+        const m = text.match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const plan = JSON.parse(await fs.readFile(path.join(cacheDir, `plan-${planId}.json`), 'utf8'));
+        assert.deepEqual(plan.actions.map((a) => `${a.action}:${a.path}`).sort(), ['archive:empty.txt']);
+        assert.ok(!plan.actions.some((a) => a.path === 'assets/orphan.png'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): executes archive from a plan, updates the index', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-a-lib');
+      await fs.mkdir(path.join(rawLibDir, 'assets'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'notes'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-a-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+        await fs.writeFile(orphanPath, 'fake-png');
+        await fs.utimes(orphanPath, old, old);
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await fs.writeFile(path.join(libDir, 'notes', 'ref.md'), '# R\n\n![pic][p1]\n\n[p1]: ../assets/kept.png\n');
+        const keptPath = path.join(libDir, 'assets', 'kept.png');
+        await fs.writeFile(keptPath, 'fake-png');
+        await fs.utimes(keptPath, old, old);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const stdout = execFileSync(process.execPath, [cliPath, 'apply', planId], {
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          encoding: 'utf8',
+        });
+        assert.ok(stdout.includes('executed: archive assets/orphan.png'));
+        assert.ok(stdout.includes('executed: archive empty.txt'));
+        assert.equal(await backend.exists('assets/orphan.png'), false);
+        assert.equal(await fs.readFile(path.join(libDir, 'archive/assets/orphan.png'), 'utf8'), 'fake-png');
+        assert.equal(await backend.exists('empty.txt'), false);
+        assert.equal(await fs.readFile(path.join(libDir, 'archive/empty.txt'), 'utf8'), '');
+        assert.equal(await fs.readFile(path.join(libDir, 'assets/kept.png'), 'utf8'), 'fake-png');
+        const freshIdx = new LocalSearchIndex(libDir, libDir, backend);
+        await freshIdx.buildAll();
+        const diag = await freshIdx.scanDiagnostics();
+        const orphanPaths = diag.orphanCandidates.map((c) => (typeof c === 'string' ? c : c.path));
+        assert.ok(!orphanPaths.includes('archive/assets/orphan.png'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): a changed file is skipped, the rest still execute', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-b-lib');
+      await fs.mkdir(path.join(rawLibDir, 'assets'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'notes'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-b-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+        await fs.writeFile(orphanPath, 'fake-png');
+        await fs.utimes(orphanPath, old, old);
+        const orphan2Path = path.join(libDir, 'assets', 'orphan2.png');
+        await fs.writeFile(orphan2Path, 'fake-png');
+        await fs.utimes(orphan2Path, old, old);
+        const emptyPath = path.join(libDir, 'empty.txt');
+        await fs.writeFile(emptyPath, '');
+        await fs.writeFile(path.join(libDir, 'notes', 'ref.md'), '# R\n\n![pic][p1]\n\n[p1]: ../assets/kept.png\n');
+        const keptPath = path.join(libDir, 'assets', 'kept.png');
+        await fs.writeFile(keptPath, 'fake-png');
+        await fs.utimes(keptPath, old, old);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const newer = new Date(Date.now() + 5000);
+        await fs.writeFile(emptyPath, 'changed content');
+        await fs.utimes(emptyPath, newer, newer);
+        const stdout = execFileSync(process.execPath, [cliPath, 'apply', planId], {
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          encoding: 'utf8',
+        });
+        assert.ok(stdout.includes('skipped: archive empty.txt'));
+        assert.ok(stdout.includes('content changed'));
+        assert.ok(stdout.includes('executed: archive assets/orphan.png'));
+        assert.equal(await fs.readFile(emptyPath, 'utf8'), 'changed content');
+        assert.equal(await backend.exists('archive/assets/orphan.png'), true);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): an action whose path cannot be written is skipped, the rest still execute', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-unwritable-lib');
+      await fs.mkdir(path.join(rawLibDir, 'assets'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'notes'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-unwritable-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+        await fs.writeFile(orphanPath, 'fake-png');
+        await fs.utimes(orphanPath, old, old);
+        const emptyPath = path.join(libDir, 'empty.txt');
+        await fs.writeFile(emptyPath, '');
+        await fs.writeFile(path.join(libDir, 'notes', 'ref.md'), '# R\n\n![pic][p1]\n\n[p1]: ../assets/kept.png\n');
+        const keptPath = path.join(libDir, 'assets', 'kept.png');
+        await fs.writeFile(keptPath, 'fake-png');
+        await fs.utimes(keptPath, old, old);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const planPath = path.join(resolveIndexCacheDir(libDir), `plan-${planId}.json`);
+        const plan = JSON.parse(await fs.readFile(planPath, 'utf8'));
+        plan.actions.push({
+          action: 'archive',
+          path: 'meeting 10:30.md',
+          sha256: '0'.repeat(64),
+          mtimeMs: Date.now(),
+          reason: 'empty file (0 bytes)',
+          kind: 'empty',
+        });
+        await fs.writeFile(planPath, JSON.stringify(plan, null, 2), 'utf8');
+        const stdout = execFileSync(process.execPath, [cliPath, 'apply', planId], {
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          encoding: 'utf8',
+        });
+        assert.ok(stdout.includes('skipped: archive meeting 10:30.md'));
+        assert.ok(stdout.includes('path not allowed for writing'));
+        assert.ok(stdout.includes('executed: archive assets/orphan.png'));
+        assert.ok(stdout.includes('executed: archive empty.txt'));
+        assert.ok(stdout.includes('2 executed, 1 skipped'));
+        assert.equal(await backend.exists('archive/assets/orphan.png'), true);
+        assert.equal(await backend.exists('archive/empty.txt'), true);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): a plan where every action is skipped exits non-zero', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-allskip-lib');
+      await fs.mkdir(path.join(rawLibDir, 'assets'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'notes'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-allskip-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+        await fs.writeFile(orphanPath, 'fake-png');
+        await fs.utimes(orphanPath, old, old);
+        const emptyPath = path.join(libDir, 'empty.txt');
+        await fs.writeFile(emptyPath, '');
+        await fs.writeFile(path.join(libDir, 'notes', 'ref.md'), '# R\n\n![pic][p1]\n\n[p1]: ../assets/kept.png\n');
+        const keptPath = path.join(libDir, 'assets', 'kept.png');
+        await fs.writeFile(keptPath, 'fake-png');
+        await fs.utimes(keptPath, old, old);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const newer = new Date(Date.now() + 5000);
+        await fs.writeFile(emptyPath, 'changed content');
+        await fs.utimes(emptyPath, newer, newer);
+        await fs.writeFile(orphanPath, 'changed-png');
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', planId], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.notEqual(caught, null);
+        assert.equal(caught.status, 1);
+        const output = `${caught.stdout ?? ''}${caught.stderr ?? ''}`;
+        assert.ok(output.includes('0 executed, 2 skipped'));
+        assert.ok(output.includes('skipped: archive assets/orphan.png'));
+        assert.ok(output.includes('skipped: archive empty.txt'));
+        assert.ok(output.includes('All actions were skipped'));
+        assert.equal(await fs.readFile(orphanPath, 'utf8'), 'changed-png');
+        assert.equal(await fs.readFile(emptyPath, 'utf8'), 'changed content');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): a plan older than 7 days is rejected', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-expired-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-expired-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const planPath = path.join(resolveIndexCacheDir(libDir), `plan-${planId}.json`);
+        const planObj = JSON.parse(await fs.readFile(planPath, 'utf8'));
+        planObj.createdAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+        await fs.writeFile(planPath, JSON.stringify(planObj, null, 2));
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', planId], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.notEqual(caught, null);
+        assert.equal(caught.status, 1);
+        const output = `${caught.stdout ?? ''}${caught.stderr ?? ''}`;
+        assert.ok(output.includes('Plan expired'));
+        assert.equal(await backend.exists('empty.txt'), true);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): unknown plan ID errors and touches nothing', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-c-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-c-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        await fs.writeFile(path.join(libDir, 'keep.md'), 'keep');
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', '20260101000000-abcdef'], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const combined = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(combined.includes('Plan not found'));
+        assert.equal(await fs.readFile(path.join(libDir, 'keep.md'), 'utf8'), 'keep');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+    await check('0.9.0 apply (CLI): a malformed plan ID is rejected', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-malformed-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-malformed-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        await fs.writeFile(path.join(libDir, 'keep.md'), 'keep');
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', 'does-not-exist-123'], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const combined = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(combined.includes('Plan file is invalid'));
+        assert.equal(await fs.readFile(path.join(libDir, 'keep.md'), 'utf8'), 'keep');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+    await check('0.9.0 apply (CLI): a tampered plan with a path traversal is rejected and touches nothing', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-tamper-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-tamper-cache');
+      const outsideFile = path.join(scratch, 'apply-cli-tamper-outside.txt');
+      await fs.writeFile(outsideFile, 'still here');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        await fs.writeFile(path.join(libDir, 'keep.md'), 'keep');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        await fs.mkdir(cacheDir, { recursive: true });
+        await fs.writeFile(
+          path.join(cacheDir, 'plan-20260101000000-abcdef.json'),
+          JSON.stringify({
+            planId: '20260101000000-abcdef',
+            createdAt: new Date().toISOString(),
+            actions: [{ action: 'archive', path: '../outside.txt', sha256: '0'.repeat(64), mtimeMs: Date.now(), reason: 'empty file (0 bytes)', kind: 'empty' }],
+          }, null, 2),
+        );
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', '20260101000000-abcdef'], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const combined = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(combined.includes('Plan file is invalid'));
+        assert.equal(await fs.readFile(outsideFile, 'utf8'), 'still here');
+        assert.equal(await fs.readFile(path.join(libDir, 'keep.md'), 'utf8'), 'keep');
+        assert.equal(await backend.exists('archive/outside.txt'), false);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+    await check('0.9.0 apply (CLI): a plan with an unknown action kind is rejected and touches nothing', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-badkind-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-badkind-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        await fs.writeFile(path.join(libDir, 'keep.md'), 'keep');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        await fs.mkdir(cacheDir, { recursive: true });
+        await fs.writeFile(
+          path.join(cacheDir, 'plan-20260102000000-abcdef.json'),
+          JSON.stringify({
+            planId: '20260102000000-abcdef',
+            createdAt: new Date().toISOString(),
+            actions: [{ action: 'archive', path: 'empty.txt', sha256: '0'.repeat(64), mtimeMs: Date.now(), reason: 'empty file (0 bytes)', kind: 'bogus' }],
+          }, null, 2),
+        );
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', '20260102000000-abcdef'], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const combined = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(combined.includes('Plan file is invalid'));
+        assert.equal(await fs.readFile(path.join(libDir, 'keep.md'), 'utf8'), 'keep');
+        assert.equal(await backend.exists('archive/empty.txt'), false);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+    await check('0.9.0 apply (CLI): a plan with an Archive/ path is rejected and touches nothing', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-archivecase-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-archivecase-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        await fs.writeFile(path.join(libDir, 'keep.md'), 'keep');
+        const cacheDir = resolveIndexCacheDir(libDir);
+        await fs.mkdir(cacheDir, { recursive: true });
+        await fs.writeFile(
+          path.join(cacheDir, 'plan-20260103000000-abcdef.json'),
+          JSON.stringify({
+            planId: '20260103000000-abcdef',
+            createdAt: new Date().toISOString(),
+            actions: [{ action: 'archive', path: 'Archive/empty.txt', sha256: '0'.repeat(64), mtimeMs: Date.now(), reason: 'empty file (0 bytes)', kind: 'empty' }],
+          }, null, 2),
+        );
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', '20260103000000-abcdef'], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const combined = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(combined.includes('Plan file is invalid'));
+        assert.equal(await fs.readFile(path.join(libDir, 'keep.md'), 'utf8'), 'keep');
+        assert.equal(await backend.exists('archive/empty.txt'), false);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+    await check('0.9.0 apply (CLI): an orphan that became referenced after planning is skipped, the rest still execute', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-orphanref-lib');
+      await fs.mkdir(path.join(rawLibDir, 'assets'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'notes'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-orphanref-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+        await fs.writeFile(orphanPath, 'fake-png');
+        await fs.utimes(orphanPath, old, old);
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await fs.writeFile(path.join(libDir, 'notes', 'ref.md'), '# R\n\n![pic][p1]\n\n[p1]: ../assets/kept.png\n');
+        const keptPath = path.join(libDir, 'assets', 'kept.png');
+        await fs.writeFile(keptPath, 'fake-png');
+        await fs.utimes(keptPath, old, old);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        await fs.writeFile(path.join(libDir, 'notes', 'new.md'), '# N\n\n![pic][p1]\n\n[p1]: ../assets/orphan.png\n');
+        const stdout = execFileSync(process.execPath, [cliPath, 'apply', planId], {
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          encoding: 'utf8',
+        });
+        assert.ok(stdout.includes('skipped: archive assets/orphan.png'));
+        assert.ok(stdout.includes('no longer an orphan'));
+        assert.ok(stdout.includes('executed: archive empty.txt'));
+        assert.equal(await backend.exists('assets/orphan.png'), true);
+        assert.equal(await fs.readFile(path.join(libDir, 'archive/empty.txt'), 'utf8'), '');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+    await check('0.9.0 apply (CLI): a tampered reason does not bypass the re-check when kind is intact', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-kinddispatch-lib');
+      await fs.mkdir(path.join(rawLibDir, 'assets'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'notes'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-kinddispatch-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const orphanPath = path.join(libDir, 'assets', 'orphan.png');
+        await fs.writeFile(orphanPath, 'fake-png');
+        await fs.utimes(orphanPath, old, old);
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await fs.writeFile(path.join(libDir, 'notes', 'ref.md'), '# R\n\n![pic][p1]\n\n[p1]: ../assets/kept.png\n');
+        const keptPath = path.join(libDir, 'assets', 'kept.png');
+        await fs.writeFile(keptPath, 'fake-png');
+        await fs.utimes(keptPath, old, old);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const planPath = path.join(resolveIndexCacheDir(libDir), `plan-${planId}.json`);
+        const planData = JSON.parse(await fs.readFile(planPath, 'utf8'));
+        const orphanAction = planData.actions.find((a) => a.path === 'assets/orphan.png');
+        assert.ok(orphanAction);
+        orphanAction.reason = 'tampered reason';
+        await fs.writeFile(planPath, JSON.stringify(planData, null, 2));
+        await fs.writeFile(path.join(libDir, 'notes', 'new.md'), '# N\n\n![pic][p1]\n\n[p1]: ../assets/orphan.png\n');
+        const stdout = execFileSync(process.execPath, [cliPath, 'apply', planId], {
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          encoding: 'utf8',
+        });
+        assert.ok(stdout.includes('skipped: archive assets/orphan.png'));
+        assert.ok(stdout.includes('no longer an orphan'));
+        assert.ok(stdout.includes('executed: archive empty.txt'));
+        assert.equal(await backend.exists('assets/orphan.png'), true);
+        assert.equal(await fs.readFile(path.join(libDir, 'archive/empty.txt'), 'utf8'), '');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+    await check('0.9.0 apply (CLI): a duplicate whose keeper changed after planning is skipped', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-dupkeeper-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-dupkeeper-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const sameTime = new Date(Date.now() - 10 * 1000);
+        await fs.writeFile(path.join(libDir, 'dup-a.txt'), 'same-content');
+        await fs.writeFile(path.join(libDir, 'dup-b.txt'), 'same-content');
+        await fs.utimes(path.join(libDir, 'dup-a.txt'), sameTime, sameTime);
+        await fs.utimes(path.join(libDir, 'dup-b.txt'), sameTime, sameTime);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        await fs.writeFile(path.join(libDir, 'dup-a.txt'), 'changed content');
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', planId], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        // The plan's only action is skipped, so apply exits non-zero (Issue 6).
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const stdout = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(stdout.includes('skipped: archive dup-b.txt'));
+        assert.ok(stdout.includes('no longer a duplicate'));
+        assert.ok(stdout.includes('All actions were skipped'));
+        assert.equal(await backend.exists('dup-b.txt'), true);
+        assert.equal(await fs.readFile(path.join(libDir, 'dup-a.txt'), 'utf8'), 'changed content');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): a duplicate whose keeper is the file itself is skipped', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-dupselfkeeper-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-dupselfkeeper-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const sameTime = new Date(Date.now() - 10 * 1000);
+        await fs.writeFile(path.join(libDir, 'dup-a.txt'), 'same-content');
+        await fs.writeFile(path.join(libDir, 'dup-b.txt'), 'same-content');
+        await fs.utimes(path.join(libDir, 'dup-a.txt'), sameTime, sameTime);
+        await fs.utimes(path.join(libDir, 'dup-b.txt'), sameTime, sameTime);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const planPath = path.join(resolveIndexCacheDir(libDir), `plan-${planId}.json`);
+        const planData = JSON.parse(await fs.readFile(planPath, 'utf8'));
+        const dupAction = planData.actions.find((a) => a.path === 'dup-b.txt');
+        assert.ok(dupAction);
+        dupAction.keeper = 'dup-b.txt';
+        dupAction.reason = 'duplicate of dup-b.txt (kept: earliest modified time)';
+        await fs.writeFile(planPath, JSON.stringify(planData, null, 2));
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', planId], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const stdout = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(stdout.includes('skipped: archive dup-b.txt'));
+        assert.ok(stdout.includes('no longer a duplicate'));
+        assert.ok(stdout.includes('All actions were skipped'));
+        assert.equal(await backend.exists('dup-b.txt'), true);
+        assert.equal(await fs.readFile(path.join(libDir, 'dup-a.txt'), 'utf8'), 'same-content');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): a duplicate whose keeper was deleted after planning is skipped', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-dupdelkeeper-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-dupdelkeeper-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const sameTime = new Date(Date.now() - 10 * 1000);
+        await fs.writeFile(path.join(libDir, 'dup-a.txt'), 'same-content');
+        await fs.writeFile(path.join(libDir, 'dup-b.txt'), 'same-content');
+        await fs.utimes(path.join(libDir, 'dup-a.txt'), sameTime, sameTime);
+        await fs.utimes(path.join(libDir, 'dup-b.txt'), sameTime, sameTime);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        await fs.unlink(path.join(libDir, 'dup-a.txt'));
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', planId], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const stdout = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(stdout.includes('skipped: archive dup-b.txt'));
+        assert.ok(stdout.includes('keeper no longer on disk'));
+        assert.ok(stdout.includes('All actions were skipped'));
+        assert.equal(await backend.exists('dup-b.txt'), true);
+        assert.equal(await backend.exists('dup-a.txt'), false);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply (CLI): a duplicate whose keeper path is unreadable is skipped, not a crash', async () => {
+      const rawLibDir = path.join(scratch, 'apply-cli-dupnulkeeper-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-cli-dupnulkeeper-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup } = await import('../dist/tools.js');
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const cliPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        const sameTime = new Date(Date.now() - 10 * 1000);
+        await fs.writeFile(path.join(libDir, 'dup-a.txt'), 'same-content');
+        await fs.writeFile(path.join(libDir, 'dup-b.txt'), 'same-content');
+        await fs.utimes(path.join(libDir, 'dup-a.txt'), sameTime, sameTime);
+        await fs.utimes(path.join(libDir, 'dup-b.txt'), sameTime, sameTime);
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const planPath = path.join(resolveIndexCacheDir(libDir), `plan-${planId}.json`);
+        const planData = JSON.parse(await fs.readFile(planPath, 'utf8'));
+        const dupAction = planData.actions.find((a) => a.path === 'dup-b.txt');
+        assert.ok(dupAction);
+        // B1 (0.9.0 fix): isSafePlanPath now rejects NUL bytes, so a NUL
+        // keeper is rejected at plan validation (whole plan invalid). Use a
+        // keeper that passes validation but is not on disk, so the
+        // per-action "keeper no longer on disk" skip is exercised instead.
+        dupAction.keeper = 'missing-keeper.txt';
+        dupAction.reason = 'duplicate of missing-keeper.txt (kept: earliest modified time)';
+        await fs.writeFile(planPath, JSON.stringify(planData, null, 2));
+        let caught = null;
+        try {
+          execFileSync(process.execPath, [cliPath, 'apply', planId], {
+            env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+            encoding: 'utf8',
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught !== null);
+        assert.equal(caught.status, 1);
+        const stdout = `${caught.stderr ?? ''}${caught.stdout ?? ''}`;
+        assert.ok(stdout.includes('skipped: archive dup-b.txt'));
+        assert.ok(stdout.includes('keeper no longer on disk'));
+        assert.ok(stdout.includes('All actions were skipped'));
+        assert.equal(await backend.exists('dup-b.txt'), true);
+        assert.equal(await fs.readFile(path.join(libDir, 'dup-a.txt'), 'utf8'), 'same-content');
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 apply_plan (MCP): executes archive from a plan', async () => {
+      const rawLibDir = path.join(scratch, 'apply-mcp-a-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-mcp-a-cache');
+      await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+      let mcpTransport = null;
+      let mcpClient = null;
+      try {
+        mcpTransport = new StdioClientTransport({
+          command: process.execPath,
+          args: [SERVER],
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          stderr: 'pipe',
+        });
+        mcpClient = new Client(
+          { name: 'memdrive-protocol-test-apply-a', version: '0.1.0' },
+          { capabilities: {} },
+        );
+        await mcpClient.connect(mcpTransport);
+        const call = async (name, args) => mcpClient.callTool({ name, arguments: args });
+        const planRes = await call('plan_cleanup', {});
+        assert.equal(planRes.isError, undefined, textOf(planRes));
+        const m = textOf(planRes).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const applyRes = await call('apply_plan', { plan_id: planId });
+        assert.equal(applyRes.isError, undefined, textOf(applyRes));
+        const out = textOf(applyRes);
+        assert.ok(out.includes('executed: archive empty.txt'));
+        assert.ok(out.includes('Applied plan'));
+        const backend = new LocalStorageBackend(libDir);
+        assert.equal(await backend.exists('empty.txt'), false);
+        assert.equal(await fs.readFile(path.join(libDir, 'archive/empty.txt'), 'utf8'), '');
+      } finally {
+        await mcpClient?.close().catch(() => undefined);
+        await mcpTransport?.close().catch(() => undefined);
+      }
+    });
+
+    await check('0.9.0 apply_plan (MCP): unknown plan ID reports Plan not found and touches nothing', async () => {
+      const rawLibDir = path.join(scratch, 'apply-mcp-b-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-mcp-b-cache');
+      await fs.writeFile(path.join(libDir, 'keep.md'), 'keep');
+      let mcpTransport = null;
+      let mcpClient = null;
+      try {
+        mcpTransport = new StdioClientTransport({
+          command: process.execPath,
+          args: [SERVER],
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          stderr: 'pipe',
+        });
+        mcpClient = new Client(
+          { name: 'memdrive-protocol-test-apply-b', version: '0.1.0' },
+          { capabilities: {} },
+        );
+        await mcpClient.connect(mcpTransport);
+        const call = async (name, args) => mcpClient.callTool({ name, arguments: args });
+        const applyRes = await call('apply_plan', { plan_id: '20260101000000-abcdef' });
+        assert.equal(applyRes.isError, true, textOf(applyRes));
+        assert.ok(textOf(applyRes).includes('Plan not found'));
+        assert.equal(await fs.readFile(path.join(libDir, 'keep.md'), 'utf8'), 'keep');
+      } finally {
+        await mcpClient?.close().catch(() => undefined);
+        await mcpTransport?.close().catch(() => undefined);
+      }
+    });
+
+    await check('0.9.0 apply_plan (MCP): changed file is skipped and not archived', async () => {
+      const rawLibDir = path.join(scratch, 'apply-mcp-c-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'apply-mcp-c-cache');
+      const emptyPath = path.join(libDir, 'empty.txt');
+      await fs.writeFile(emptyPath, '');
+      let mcpTransport = null;
+      let mcpClient = null;
+      try {
+        mcpTransport = new StdioClientTransport({
+          command: process.execPath,
+          args: [SERVER],
+          env: { ...process.env, MEMDRIVE_ROOT: libDir, MEMDRIVE_CACHE_DIR: cacheBase },
+          stderr: 'pipe',
+        });
+        mcpClient = new Client(
+          { name: 'memdrive-protocol-test-apply-c', version: '0.1.0' },
+          { capabilities: {} },
+        );
+        await mcpClient.connect(mcpTransport);
+        const call = async (name, args) => mcpClient.callTool({ name, arguments: args });
+        const planRes = await call('plan_cleanup', {});
+        assert.equal(planRes.isError, undefined, textOf(planRes));
+        const m = textOf(planRes).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const planId = m[1];
+        const newer = new Date(Date.now() + 5000);
+        await fs.writeFile(emptyPath, 'changed content');
+        await fs.utimes(emptyPath, newer, newer);
+        const applyRes = await call('apply_plan', { plan_id: planId });
+        assert.equal(applyRes.isError, true, textOf(applyRes));
+        assert.ok(textOf(applyRes).includes('skipped'));
+        assert.equal(await fs.readFile(emptyPath, 'utf8'), 'changed content');
+        const backend = new LocalStorageBackend(libDir);
+        assert.equal(await backend.exists('archive/empty.txt'), false);
+      } finally {
+        await mcpClient?.close().catch(() => undefined);
+        await mcpTransport?.close().catch(() => undefined);
+      }
+    });
+
+    await check('0.9.0 index (class): diagnostics does not list a reference-style-linked image as an orphan', async () => {
+      const libDir = path.join(scratch, 'index-refstyle-lib');
+      await fs.mkdir(path.join(libDir, 'notes'), { recursive: true });
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-refstyle-cache');
+      try {
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        await fs.writeFile(path.join(libDir, 'notes', 'n.md'), '# N\n\n![pic][p1]\n\n[p1]: ../assets/ref.png\n');
+        const refPath = path.join(libDir, 'assets', 'ref.png');
+        await fs.writeFile(refPath, 'fake-png');
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        await fs.utimes(refPath, old, old);
+        await idx.buildAll();
+        const diag = await idx.scanDiagnostics();
+        assert.ok(!diag.orphanCandidates.includes('assets/ref.png'));
+        assert.deepEqual(diag.brokenImageRefs, []);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 index (class): diagnostics does not list a fresh unreferenced image as an orphan (24h retention, item 7)', async () => {
+      const libDir = path.join(scratch, 'index-orphan-retention-lib');
+      await fs.mkdir(path.join(libDir, 'assets'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-orphan-retention-cache');
+      try {
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const freshPath = path.join(libDir, 'assets', 'fresh.png');
+        await fs.writeFile(freshPath, 'fake-png');
+        const freshTime = new Date(Date.now() - 23 * 60 * 60 * 1000);
+        await fs.utimes(freshPath, freshTime, freshTime);
+        const oldPath = path.join(libDir, 'assets', 'old.png');
+        await fs.writeFile(oldPath, 'fake-png');
+        const oldTime = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        await fs.utimes(oldPath, oldTime, oldTime);
+        await idx.buildAll();
+        const diag = await idx.scanDiagnostics();
+        assert.ok(!diag.orphanCandidates.includes('assets/fresh.png'));
+        assert.ok(diag.orphanCandidates.includes('assets/old.png'));
+        assert.deepEqual(diag.brokenImageRefs, []);
+        assert.equal(diag.scanIncomplete, false);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 index (class): scoped diagnostics report notes that skipped notes outside the scope also withhold the orphan list', async () => {
+      const libDir = path.join(scratch, 'index-scoped-skipped-lib');
+      await fs.mkdir(path.join(libDir, 'sub'), { recursive: true });
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'index-scoped-skipped-cache');
+      try {
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const imgPath = path.join(libDir, 'sub', 'orphan.png');
+        await fs.writeFile(imgPath, 'fake-png');
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        await fs.utimes(imgPath, old, old);
+        await fs.writeFile(path.join(libDir, 'big.md'), 'x'.repeat(1500));
+        await idx.buildAll();
+        let diag;
+        process.env['MEMDRIVE_INDEX_MAX_BYTES'] = '1000';
+        try {
+          diag = await idx.scanDiagnostics('sub');
+        } finally {
+          delete process.env['MEMDRIVE_INDEX_MAX_BYTES'];
+        }
+        assert.equal(diag.scanIncomplete, true);
+        assert.ok(diag.skippedNotes.some((n) => n.file === 'big.md'));
+        assert.deepEqual(diag.orphanCandidates, []);
+        const { formatDiagnostics } = await import('../dist/tools.js');
+        const report = formatDiagnostics(diag, 'sub');
+        assert.ok(report.includes('outside the requested scope'));
+        assert.ok(report.includes('big.md'));
+        const plain = formatDiagnostics(diag);
+        assert.ok(!plain.includes('outside the requested scope'));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
     });
 
     await check('0.8.0 index (class): two instances building at once do not corrupt the shared index', async () => {
@@ -3757,6 +5198,302 @@ async function main() {
       const diagNoKw = await call('search_files', { diagnostics_only: true });
       assert.equal(diagNoKw.isError, undefined, textOf(diagNoKw));
       assert.match(textOf(diagNoKw), /Library diagnostics \(read-only/);
+    });
+
+    await check('0.9.0 edit_tags: add tag to a note with no front matter (creates minimal block)', async () => {
+      await call('save_file', {
+        path: 'tags/no-fm.md',
+        content: '# No Front Matter\n\nPlain note body.\n',
+        mode: 'new',
+      });
+      const res = await call('edit_tags', { path: 'tags/no-fm.md', operation: 'add', tag: 'work' });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /added "work"/);
+      const after = await fs.readFile(path.join(root, 'tags', 'no-fm.md'), 'utf8');
+      assert.equal(after, '---\ntags: [work]\n---\n# No Front Matter\n\nPlain note body.\n');
+    });
+
+    await check('0.9.0 edit_tags: add a tag to flow-list front matter', async () => {
+      await call('save_file', {
+        path: 'tags/flow.md',
+        content: '---\ntags: [alpha]\ndate: 2026-02-02\n---\n\n# Flow\n\nBody text.\n',
+        mode: 'new',
+      });
+      const res = await call('edit_tags', { path: 'tags/flow.md', operation: 'add', tag: 'beta' });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /added "beta"/);
+      const after = await fs.readFile(path.join(root, 'tags', 'flow.md'), 'utf8');
+      assert.equal(after, '---\ntags: [alpha, beta]\ndate: 2026-02-02\n---\n\n# Flow\n\nBody text.\n');
+    });
+
+    await check('0.9.0 edit_tags: add a tag to block-list front matter', async () => {
+      await call('save_file', {
+        path: 'tags/block.md',
+        content: '---\ntags:\n  - alpha\n  - beta\ndate: 2026-02-02\n---\n\n# Block\n\nBody.\n',
+        mode: 'new',
+      });
+      const res = await call('edit_tags', { path: 'tags/block.md', operation: 'add', tag: 'gamma' });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /added "gamma"/);
+      const after = await fs.readFile(path.join(root, 'tags', 'block.md'), 'utf8');
+      assert.equal(after, '---\ntags:\n  - alpha\n  - beta\n  - gamma\ndate: 2026-02-02\n---\n\n# Block\n\nBody.\n');
+    });
+
+    await check('0.9.0 edit_tags: remove a tag from front matter', async () => {
+      await call('save_file', {
+        path: 'tags/remove.md',
+        content: '---\ntags: [alpha, beta]\n---\n\n# R\n\nBody.\n',
+        mode: 'new',
+      });
+      const res = await call('edit_tags', { path: 'tags/remove.md', operation: 'remove', tag: 'alpha' });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /removed "alpha"/);
+      const after = await fs.readFile(path.join(root, 'tags', 'remove.md'), 'utf8');
+      assert.equal(after, '---\ntags: [beta]\n---\n\n# R\n\nBody.\n');
+    });
+
+    await check('0.9.0 edit_tags: rename a tag in front matter', async () => {
+      await call('save_file', {
+        path: 'tags/rename.md',
+        content: '---\ntags: [alpha, beta]\n---\n\n# Rn\n\nBody.\n',
+        mode: 'new',
+      });
+      const res = await call('edit_tags', { path: 'tags/rename.md', operation: 'rename', tag: 'alpha', new_tag: 'omega' });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /renamed "alpha" to "omega"/);
+      const after = await fs.readFile(path.join(root, 'tags', 'rename.md'), 'utf8');
+      assert.equal(after, '---\ntags: [omega, beta]\n---\n\n# Rn\n\nBody.\n');
+    });
+
+    await check('0.9.0 edit_tags: add existing, remove missing, rename to existing are no-ops', async () => {
+      const original = '---\ntags: [alpha, beta]\n---\n\n# N\n\nBody #alpha.\n';
+      await call('save_file', { path: 'tags/noop.md', content: original, mode: 'new' });
+      const addExisting = await call('edit_tags', { path: 'tags/noop.md', operation: 'add', tag: 'ALPHA' });
+      assert.equal(addExisting.isError, undefined, textOf(addExisting));
+      assert.match(textOf(addExisting), /No change/);
+      const removeMissing = await call('edit_tags', { path: 'tags/noop.md', operation: 'remove', tag: 'missing' });
+      assert.equal(removeMissing.isError, undefined, textOf(removeMissing));
+      assert.match(textOf(removeMissing), /No change/);
+      const renameCollision = await call('edit_tags', { path: 'tags/noop.md', operation: 'rename', tag: 'alpha', new_tag: 'beta' });
+      assert.equal(renameCollision.isError, undefined, textOf(renameCollision));
+      assert.match(textOf(renameCollision), /No change/);
+      const after = await fs.readFile(path.join(root, 'tags', 'noop.md'), 'utf8');
+      assert.equal(after, original);
+    });
+
+    await check('0.9.0 edit_tags: body tags — add, remove, rename', async () => {
+      await call('save_file', {
+        path: 'tags/body.md',
+        content: '# Body Tags Note\n\nFirst paragraph with #alpha inline.\n\n#standalone\n',
+        mode: 'new',
+      });
+      const added = await call('edit_tags', { path: 'tags/body.md', operation: 'add', tag: 'beta', location: 'body' });
+      assert.equal(added.isError, undefined, textOf(added));
+      assert.match(textOf(added), /added "beta"/);
+      const removed = await call('edit_tags', { path: 'tags/body.md', operation: 'remove', tag: 'alpha', location: 'body' });
+      assert.equal(removed.isError, undefined, textOf(removed));
+      assert.match(textOf(removed), /removed "alpha"/);
+      const renamed = await call('edit_tags', { path: 'tags/body.md', operation: 'rename', tag: 'beta', new_tag: 'gamma', location: 'body' });
+      assert.equal(renamed.isError, undefined, textOf(renamed));
+      assert.match(textOf(renamed), /renamed "beta" to "gamma"/);
+      const dropped = await call('edit_tags', { path: 'tags/body.md', operation: 'remove', tag: 'standalone', location: 'body' });
+      assert.equal(dropped.isError, undefined, textOf(dropped));
+      const after = await fs.readFile(path.join(root, 'tags', 'body.md'), 'utf8');
+      assert.equal(after, '# Body Tags Note\n\nFirst paragraph with inline.\n\n#gamma\n');
+    });
+
+    await check('0.9.0 edit_tags: after rename, searchable by new tag, not by old tag', async () => {
+      await call('save_file', {
+        path: 'tags/searchable.md',
+        content: '---\ntags: [oldname]\n---\n\n# Searchable\n\nA quokka note for tag search.\n',
+        mode: 'new',
+      });
+      const res = await call('edit_tags', { path: 'tags/searchable.md', operation: 'rename', tag: 'oldname', new_tag: 'newname' });
+      assert.equal(res.isError, undefined, textOf(res));
+      const byNew = await call('search_files', { keyword: 'quokka', tags: ['newname'], rebuild_index: true });
+      assert.equal(byNew.isError, undefined, textOf(byNew));
+      assert.match(textOf(byNew), /tags\/searchable\.md/);
+      const byOld = await call('search_files', { keyword: 'quokka', tags: ['oldname'] });
+      assert.equal(byOld.isError, undefined, textOf(byOld));
+      assert.doesNotMatch(textOf(byOld), /tags\/searchable\.md/);
+    });
+
+    await check('0.9.0 edit_tags: content outside tag lines is byte-identical', async () => {
+      const original =
+        '---\ntitle: Byte Check\ntags: [alpha, beta]\ndate: 2026-01-01\n---\n\n# Heading\n\nSome text with #bodytag inline.\n\n```js\n// #notatag in code\nconst x = 1;\n```\n\nFinal line.\n';
+      await fs.writeFile(path.join(root, 'tags', 'bytes.md'), original);
+      const res = await call('edit_tags', { path: 'tags/bytes.md', operation: 'rename', tag: 'alpha', new_tag: 'omega' });
+      assert.equal(res.isError, undefined, textOf(res));
+      const after = await fs.readFile(path.join(root, 'tags', 'bytes.md'), 'utf8');
+      assert.equal(
+        after,
+        '---\ntitle: Byte Check\ntags: [omega, beta]\ndate: 2026-01-01\n---\n\n# Heading\n\nSome text with #bodytag inline.\n\n```js\n// #notatag in code\nconst x = 1;\n```\n\nFinal line.\n',
+      );
+    });
+
+    await check('0.9.0 edit_tags: out-of-bounds path and missing file are rejected', async () => {
+      const escape = await call('edit_tags', { path: '../outside.md', operation: 'add', tag: 'x' });
+      assert.equal(escape.isError, true);
+      const missing = await call('edit_tags', { path: 'tags/does-not-exist.md', operation: 'add', tag: 'x' });
+      assert.equal(missing.isError, true);
+      const absOutside = await call('edit_tags', { path: path.join(outside, 'secret.txt'), operation: 'add', tag: 'x' });
+      assert.equal(absOutside.isError, true);
+    });
+
+    await check('0.9.0 edit_tags: invalid tag names and missing new_tag are rejected', async () => {
+      await call('save_file', {
+        path: 'tags/valid.md',
+        content: '# Valid\n\nBody.\n',
+        mode: 'new',
+      });
+      const spacedBody = await call('edit_tags', { path: 'tags/valid.md', operation: 'add', tag: 'my tag', location: 'body' });
+      assert.equal(spacedBody.isError, true);
+      const bracketFm = await call('edit_tags', { path: 'tags/valid.md', operation: 'add', tag: '[bad' });
+      assert.equal(bracketFm.isError, true);
+      const noNew = await call('edit_tags', { path: 'tags/valid.md', operation: 'rename', tag: 'x' });
+      assert.equal(noNew.isError, true);
+    });
+
+    await check('0.9.0 search_files (MCP): out-of-range offset reports no more results without broken range', async () => {
+      const res = await call('search_files', { keyword: '全文检索', path: 'search8', offset: 100 });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /No more results/);
+      assert.doesNotMatch(textOf(res), /showing 101–100/);
+    });
+
+    await check('0.9.0 save_file: escapeImageAlt escapes backslashes and closing brackets', async () => {
+      const { escapeImageAlt } = await import('../dist/tools.js');
+      assert.equal(escapeImageAlt('shot'), 'shot');
+      assert.equal(escapeImageAlt('a\\'), 'a\\\\');
+      assert.equal(escapeImageAlt('a]b'), 'a\\]b');
+      assert.equal(escapeImageAlt('a\\]'), 'a\\\\\\]');
+    });
+
+    await check('0.9.0 archive: archive a note moves it under archive/, removes from search, keeps nested archive/ indexed, and list_directory shows archive/', async () => {
+      await call('save_file', {
+        path: 'arch/notes/retire-me.md',
+        content: '# Retire\n\nUnique token zxqarchivekw901 for search.\n',
+        mode: 'new',
+      });
+      await call('save_file', {
+        path: 'arch/archive/keep-indexed.md',
+        content: '# Nested Archive Folder\n\nUnique token zxqnestedarch902 stays searchable.\n',
+        mode: 'new',
+      });
+      const beforeSearch = await call('search_files', { keyword: 'zxqarchivekw901' });
+      assert.equal(beforeSearch.isError, undefined, textOf(beforeSearch));
+      assert.match(textOf(beforeSearch), /arch\/notes\/retire-me\.md/);
+
+      const res = await call('archive_file', { path: 'arch/notes/retire-me.md' });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /Archived arch\/notes\/retire-me\.md to archive\/arch\/notes\/retire-me\.md\./);
+
+      await assert.rejects(fs.stat(path.join(root, 'arch', 'notes', 'retire-me.md')));
+      const movedContent = await fs.readFile(path.join(root, 'archive', 'arch', 'notes', 'retire-me.md'), 'utf8');
+      assert.match(movedContent, /zxqarchivekw901/);
+
+      const afterSearch = await call('search_files', { keyword: 'zxqarchivekw901' });
+      assert.equal(afterSearch.isError, undefined, textOf(afterSearch));
+      assert.doesNotMatch(textOf(afterSearch), /retire-me\.md/);
+
+      const nestedSearch = await call('search_files', { keyword: 'zxqnestedarch902' });
+      assert.equal(nestedSearch.isError, undefined, textOf(nestedSearch));
+      assert.match(textOf(nestedSearch), /arch\/archive\/keep-indexed\.md/);
+
+      const rootList = await call('list_directory', {});
+      assert.equal(rootList.isError, undefined, textOf(rootList));
+      assert.match(textOf(rootList), /archive/);
+    });
+
+    await check('0.9.0 archive: reject when archive destination already exists (no overwrite)', async () => {
+      await call('save_file', {
+        path: 'arch/dup.md',
+        content: 'First version.\n',
+        mode: 'new',
+      });
+      const first = await call('archive_file', { path: 'arch/dup.md' });
+      assert.equal(first.isError, undefined, textOf(first));
+
+      await call('save_file', {
+        path: 'arch/dup.md',
+        content: 'Second version.\n',
+        mode: 'new',
+      });
+      const second = await call('archive_file', { path: 'arch/dup.md' });
+      assert.equal(second.isError, true);
+      assert.equal(await fs.readFile(path.join(root, 'archive', 'arch', 'dup.md'), 'utf8'), 'First version.\n');
+      assert.equal(await fs.readFile(path.join(root, 'arch', 'dup.md'), 'utf8'), 'Second version.\n');
+    });
+
+    await check('0.9.0 archive: reject archiving inside archive/, archive/ itself, directories, out-of-bounds, and missing files', async () => {
+      const alreadyArchived = await call('archive_file', { path: 'archive/arch/dup.md' });
+      assert.equal(alreadyArchived.isError, true);
+      const archiveRoot = await call('archive_file', { path: 'archive' });
+      assert.equal(archiveRoot.isError, true);
+      const archiveSlash = await call('archive_file', { path: 'archive/' });
+      assert.equal(archiveSlash.isError, true);
+      const dirRes = await call('archive_file', { path: 'arch' });
+      assert.equal(dirRes.isError, true);
+      const escape = await call('archive_file', { path: '../outside.md' });
+      assert.equal(escape.isError, true);
+      const absOutside = await call('archive_file', { path: path.join(outside, 'secret.txt') });
+      assert.equal(absOutside.isError, true);
+      const missing = await call('archive_file', { path: 'arch/does-not-exist.md' });
+      assert.equal(missing.isError, true);
+    });
+
+    await check('0.9.0 restore: restore moves archived file back and makes it searchable again', async () => {
+      const res = await call('restore_file', { path: 'archive/arch/notes/retire-me.md' });
+      assert.equal(res.isError, undefined, textOf(res));
+      assert.match(textOf(res), /Restored archive\/arch\/notes\/retire-me\.md to arch\/notes\/retire-me\.md\./);
+
+      await assert.rejects(fs.stat(path.join(root, 'archive', 'arch', 'notes', 'retire-me.md')));
+      const restored = await fs.readFile(path.join(root, 'arch', 'notes', 'retire-me.md'), 'utf8');
+      assert.match(restored, /zxqarchivekw901/);
+
+      const searchAgain = await call('search_files', { keyword: 'zxqarchivekw901' });
+      assert.equal(searchAgain.isError, undefined, textOf(searchAgain));
+      assert.match(textOf(searchAgain), /arch\/notes\/retire-me\.md/);
+    });
+
+    await check('0.9.0 restore: reject when destination already exists, path not under archive/, out-of-bounds, or missing', async () => {
+      const conflict = await call('restore_file', { path: 'archive/arch/dup.md' });
+      assert.equal(conflict.isError, true);
+      assert.equal(await fs.readFile(path.join(root, 'arch', 'dup.md'), 'utf8'), 'Second version.\n');
+      assert.equal(await fs.readFile(path.join(root, 'archive', 'arch', 'dup.md'), 'utf8'), 'First version.\n');
+
+      const notInArchive = await call('restore_file', { path: 'arch/dup.md' });
+      assert.equal(notInArchive.isError, true);
+      const missing = await call('restore_file', { path: 'archive/arch/missing.md' });
+      assert.equal(missing.isError, true);
+      const escape = await call('restore_file', { path: '../outside.md' });
+      assert.equal(escape.isError, true);
+    });
+
+    // [Issue 1] Test that an image referenced only by an archived note is not reported as an orphan
+    await check('0.9.0 archive_file: image referenced by archived note is not an orphan', async () => {
+      const saveRes = await call('save_file', {
+        path: 'arch-diag/note-with-img.md',
+        content: '# Archived Note\n\n![pic](assets/keep-me.png)\n',
+        images: [smallPngPath],
+      });
+      assert.notEqual(saveRes.isError, true);
+      const savedText = textOf(saveRes);
+      const match = savedText.match(/arch-diag\/assets\/[^\s)]+\.png/);
+      const imgRel = match ? match[0] : 'arch-diag/assets/keep-me.png';
+      if (!(await fs.stat(path.join(root, imgRel)).catch(() => null))) {
+        await fs.mkdir(path.join(root, 'arch-diag', 'assets'), { recursive: true });
+        await fs.copyFile(smallPngPath, path.join(root, 'arch-diag', 'assets', 'keep-me.png'));
+      }
+      const old = new Date(Date.now() - 25 * 3600 * 1000);
+      await fs.utimes(path.join(root, imgRel), old, old);
+
+      const archRes = await call('archive_file', { path: 'arch-diag/note-with-img.md' });
+      assert.notEqual(archRes.isError, true);
+
+      const diagRes = await call('search_files', { diagnostics_only: true });
+      assert.notEqual(diagRes.isError, true);
+      assert.doesNotMatch(textOf(diagRes), new RegExp(imgRel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     });
 
   } finally {

@@ -1,5 +1,5 @@
 /**
- * The six MemDrive tools.
+ * The eleven MemDrive tools.
  *
  * Interaction contract (enforced via the tool descriptions the model
  * reads): before calling save_file, the model MUST show the user the
@@ -13,6 +13,7 @@
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type {
@@ -51,6 +52,7 @@ import {
 } from './images.js';
 import {
   assertInsideRealRoot,
+  decodeUserPath,
   isInside,
   sandboxPath,
   sandboxPathForWrite,
@@ -70,6 +72,450 @@ interface ToolContext {
   rootDir: string;
   rootRealDir: string;
   searchIndex: LocalSearchIndex;
+}
+
+export interface PlanAction {
+  action: 'archive';
+  path: string;
+  sha256: string;
+  mtimeMs: number;
+  reason: string;
+  kind: 'empty' | 'duplicate' | 'orphan';
+  keeper?: string;
+}
+
+export interface CleanupPlan {
+  planId: string;
+  createdAt: string;
+  actions: PlanAction[];
+}
+
+/** True when a path must never appear in a cleanup plan: any
+    path segment starting with '.', or anything under archive/.
+    Paths are POSIX-style (forward slashes). */
+function isSkippedPlanPath(p: string): boolean {
+  const lower = p.toLowerCase();
+  if (lower === 'archive' || lower.startsWith('archive/')) return true;
+  return p.split('/').some((seg) => seg.startsWith('.'));
+}
+
+/** True when the path can be written through the sandbox. A
+    path that fails (for example a name containing ':') is
+    never proposed in a plan, because apply could not
+    execute it. */
+async function isWritablePlanPath(ctx: ToolContext, p: string): Promise<boolean> {
+  try {
+    await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, p);
+    await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, `archive/${p}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function buildCleanupPlan(
+  ctx: ToolContext,
+): Promise<{ plan: CleanupPlan; preview: string }> {
+  const diag = await ctx.searchIndex.scanDiagnostics();
+  const statAndHash = async (
+    p: string,
+  ): Promise<{ sha256: string; mtimeMs: number } | null> => {
+    try {
+      const st = await ctx.backend.stat(p);
+      if (st === null) return null;
+      if (st.isDirectory) return null;
+      const mtimeMs = new Date(st.modifiedAt).getTime();
+      const size = st.size;
+      const sha256 = await ctx.backend.hashFile(p);
+      const st2 = await ctx.backend.stat(p);
+      if (st2 === null) return null;
+      if (new Date(st2.modifiedAt).getTime() !== mtimeMs || st2.size !== size) return null;
+      return { sha256, mtimeMs };
+    } catch {
+      return null;
+    }
+  };
+  const cmpPath = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  const actions: PlanAction[] = [];
+  const seenPaths = new Set<string>();
+
+  for (const p of [...diag.emptyFiles].sort(cmpPath)) {
+    if (isSkippedPlanPath(p)) continue;
+    if (!(await isWritablePlanPath(ctx, p))) continue;
+    const info = await statAndHash(p);
+    if (info === null) continue;
+    if (seenPaths.has(p)) continue;
+    actions.push({
+      action: 'archive',
+      path: p,
+      sha256: info.sha256,
+      mtimeMs: info.mtimeMs,
+      reason: 'empty file (0 bytes)',
+      kind: 'empty',
+    });
+    seenPaths.add(p);
+  }
+
+  const dupActions: PlanAction[] = [];
+  for (const group of diag.duplicateGroups) {
+    const entries: Array<{ path: string; sha256: string; mtimeMs: number }> = [];
+    for (const p of group) {
+      if (isSkippedPlanPath(p)) continue;
+      const info = await statAndHash(p);
+      if (info !== null) {
+        entries.push({ path: p, sha256: info.sha256, mtimeMs: info.mtimeMs });
+      }
+    }
+    entries.sort((a, b) =>
+      a.mtimeMs !== b.mtimeMs ? a.mtimeMs - b.mtimeMs : cmpPath(a.path, b.path),
+    );
+    const first = entries[0];
+    if (first === undefined || entries.length < 2) continue;
+    const keeper = first.path;
+    for (const entry of entries.slice(1)) {
+      if (entry.sha256 !== first.sha256) continue;
+      if (seenPaths.has(entry.path)) continue;
+      if (!(await isWritablePlanPath(ctx, entry.path))) continue;
+      dupActions.push({
+        action: 'archive',
+        path: entry.path,
+        sha256: entry.sha256,
+        mtimeMs: entry.mtimeMs,
+        reason: `duplicate of ${keeper} (kept: earliest modified time)`,
+        kind: 'duplicate',
+        keeper,
+      });
+      seenPaths.add(entry.path);
+    }
+  }
+  dupActions.sort((a, b) => cmpPath(a.path, b.path));
+  actions.push(...dupActions);
+
+  for (const p of [...diag.orphanCandidates].sort(cmpPath)) {
+    if (isSkippedPlanPath(p)) continue;
+    if (!(await isWritablePlanPath(ctx, p))) continue;
+    const info = await statAndHash(p);
+    if (info === null) continue;
+    if (seenPaths.has(p)) continue;
+    actions.push({
+      action: 'archive',
+      path: p,
+      sha256: info.sha256,
+      mtimeMs: info.mtimeMs,
+      reason: 'orphan attachment candidate (unreferenced for over 24h)',
+      kind: 'orphan',
+    });
+    seenPaths.add(p);
+  }
+
+  // A plan holds at most 200 actions, so the preview stays within
+  // the host's response budget and the preview always matches the
+  // plan file exactly.
+  const PLAN_ACTION_LIMIT = 200;
+  const limited = actions.length > PLAN_ACTION_LIMIT;
+  if (limited) actions.splice(PLAN_ACTION_LIMIT);
+
+  const now = new Date();
+  const stamp = now.toISOString().replace(/[-:T.]/g, '').slice(0, 14); // YYYYMMDDHHmmss UTC
+  const planId = `${stamp}-${crypto.randomBytes(3).toString('hex')}`;
+  const createdAt = now.toISOString();
+
+  const withheldLine = diag.scanIncomplete
+    ? `Orphan scan withheld: ${diag.skippedNotes.length} note(s) could not be read (see diagnostics_only).`
+    : null;
+  const preview =
+    actions.length === 0
+      ? [
+          'Cleanup scan complete: no candidates.',
+          ...(diag.brokenImageRefs.length > 0
+            ? [`Broken image references (${diag.brokenImageRefs.length}) need manual fixing; no file action is proposed for them.`]
+            : []),
+          ...(withheldLine === null ? [] : [withheldLine]),
+        ].join('\n')
+      : [
+          `Cleanup plan ${planId} (${actions.length} actions):`,
+          ...actions.map((a) => `- ${a.action} ${a.path} (${a.reason})`),
+          'Notes:',
+          '- Similar content is not proposed automatically; only exact SHA-256 duplicates are listed.',
+          `- Broken image references (${diag.brokenImageRefs.length}) need manual fixing; no file action is proposed for them.`,
+          `- This plan is a proposal only; nothing has been changed. Execute it with the \`apply_plan\` tool or by running \`memdrive-mcp apply ${planId}\` in a terminal.`,
+          ...(limited
+            ? ['- Plan limit reached (200 actions); apply this batch, then run plan_cleanup again for the next batch.']
+            : []),
+          ...(withheldLine === null ? [] : [`- ${withheldLine}`]),
+        ].join('\n');
+
+  return { plan: { planId, createdAt, actions }, preview };
+}
+
+export async function handlePlanCleanup(ctx: ToolContext): Promise<CallToolResult> {
+  const { plan, preview } = await buildCleanupPlan(ctx);
+  if (plan.actions.length > 0) {
+    const cacheDir = resolveIndexCacheDir(ctx.rootRealDir);
+    await fs.mkdir(cacheDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(
+      path.join(cacheDir, `plan-${plan.planId}.json`),
+      JSON.stringify(plan, null, 2),
+      { encoding: 'utf8', mode: 0o600 },
+    );
+  }
+  return okResult(preview);
+}
+
+export async function handleApplyPlan(ctx: ToolContext, planId: string): Promise<CallToolResult> {
+  const { lines, exitCode } = await runApplyCleanup(planId.trim(), ctx, { incrementalRefresh: true });
+  const text = lines.join('\n');
+  return exitCode === 0 ? okResult(text) : { content: [textBlock(text)], isError: true };
+}
+
+export interface ApplyResult {
+  lines: string[];
+  exitCode: number;
+}
+
+/** True when a plan-file path is safe to act on: relative, no
+    '..', not under archive/, and no dot-segment. Lexical
+    only; runApplyCleanup also normalizes each path through
+    sandboxPathForWrite. */
+function isSafePlanPath(p: string): boolean {
+  if (p.length === 0) return false;
+  if (p.includes('\0')) return false;
+  if (p.includes('\\')) return false;
+  if (p.startsWith('/')) return false;
+  if (/^[A-Za-z]:/.test(p)) return false;
+  const lower = p.toLowerCase();
+  if (lower === 'archive' || lower.startsWith('archive/')) return false;
+  return !p.split('/').some((seg) => seg === '..' || seg === '' || seg.startsWith('.'));
+}
+
+function isValidCleanupPlan(value: unknown, expectedPlanId: string): value is CleanupPlan {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  if (
+    obj['planId'] !== expectedPlanId ||
+    typeof obj['createdAt'] !== 'string' ||
+    obj['createdAt'].length === 0 ||
+    !Array.isArray(obj['actions'])
+  ) {
+    return false;
+  }
+  for (const item of obj['actions']) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      return false;
+    }
+    const act = item as Record<string, unknown>;
+    if (
+      act['action'] !== 'archive' ||
+      typeof act['path'] !== 'string' ||
+      act['path'].length === 0 ||
+      typeof act['sha256'] !== 'string' ||
+      act['sha256'].length === 0 ||
+      typeof act['mtimeMs'] !== 'number' ||
+      !Number.isFinite(act['mtimeMs']) ||
+      typeof act['reason'] !== 'string' ||
+      (act['kind'] !== 'empty' && act['kind'] !== 'duplicate' && act['kind'] !== 'orphan')
+    ) {
+      return false;
+    }
+    if (!isSafePlanPath(act['path'] as string)) {
+      return false;
+    }
+    if (act['kind'] === 'duplicate') {
+      if (
+        typeof act['keeper'] !== 'string' ||
+        act['keeper'].length === 0 ||
+        !isSafePlanPath(act['keeper'])
+      ) {
+        return false;
+      }
+    } else if (act['keeper'] !== undefined) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function runApplyCleanup(planId: string, ctx: ToolContext, options?: { incrementalRefresh?: boolean }): Promise<ApplyResult> {
+  if (!/^\d{14}-[0-9a-f]{6}$/.test(planId)) {
+    return { lines: [`Plan file is invalid: ${planId}`], exitCode: 1 };
+  }
+  const cacheDir = resolveIndexCacheDir(ctx.rootRealDir);
+  const planPath = path.join(cacheDir, `plan-${planId}.json`);
+
+  let raw: string;
+  try {
+    raw = await fs.readFile(planPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { lines: [`Plan not found: ${planId}`], exitCode: 1 };
+    }
+    return { lines: [`Plan file is invalid: ${planId}`], exitCode: 1 };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { lines: [`Plan file is invalid: ${planId}`], exitCode: 1 };
+  }
+  if (!isValidCleanupPlan(parsed, planId)) {
+    return { lines: [`Plan file is invalid: ${planId}`], exitCode: 1 };
+  }
+  const createdMs = Date.parse(parsed.createdAt);
+  if (!Number.isFinite(createdMs) || Date.now() - createdMs > 7 * 24 * 60 * 60 * 1000) {
+    return { lines: [`Plan expired: ${planId} (plans are valid for 7 days)`], exitCode: 1 };
+  }
+
+  const lines: string[] = [];
+  let executed = 0;
+  const executedPaths: string[] = [];
+  let skipped = 0;
+
+  const recordSkipped = (action: PlanAction, reason: string): void => {
+    lines.push(`skipped: ${action.action} ${action.path} — ${reason}`);
+    skipped++;
+  };
+
+  let diag: Diagnostics;
+  try {
+    diag = await ctx.searchIndex.scanDiagnostics();
+  } catch (error) {
+    return { lines: [`Diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}. Plan not applied.`], exitCode: 1 };
+  }
+
+  for (const action of parsed.actions) {
+    let absolute: string;
+    try {
+      absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, action.path);
+    } catch {
+      recordSkipped(action, 'path not allowed for writing');
+      continue;
+    }
+    action.path = toDisplayPath(ctx.rootDir, absolute);
+    if (isSkippedPlanPath(action.path)) {
+      recordSkipped(action, 'path not allowed for writing');
+      continue;
+    }
+
+    let st: Awaited<ReturnType<StorageBackend['stat']>>;
+    try {
+      st = await ctx.backend.stat(action.path);
+    } catch (error) {
+      recordSkipped(action, error instanceof Error ? error.message : String(error));
+      continue;
+    }
+    if (st === null) {
+      recordSkipped(action, 'file not found (it moved or was deleted after the plan was created)');
+      continue;
+    }
+    if (st.isDirectory) {
+      recordSkipped(action, 'path is a directory, not a file');
+      continue;
+    }
+
+    let currentSha: string;
+    let st2: Awaited<ReturnType<StorageBackend['stat']>>;
+    try {
+      currentSha = await ctx.backend.hashFile(action.path);
+      st2 = await ctx.backend.stat(action.path);
+    } catch (error) {
+      recordSkipped(action, error instanceof Error ? error.message : String(error));
+      continue;
+    }
+    if (st2 === null) {
+      recordSkipped(action, 'file not found (it moved or was deleted after the plan was created)');
+      continue;
+    }
+    const currentMtimeMs = new Date(st2.modifiedAt).getTime();
+    if (currentMtimeMs !== new Date(st.modifiedAt).getTime()) {
+      recordSkipped(action, 'file changed during verification');
+      continue;
+    }
+    if (currentSha !== action.sha256) {
+      recordSkipped(action, 'content changed since the plan was created');
+      continue;
+    }
+
+    if (currentMtimeMs !== action.mtimeMs) {
+      recordSkipped(action, 'modification time changed since the plan was created');
+      continue;
+    }
+
+    let noLongerReason: string | null = null;
+    if (action.kind === 'empty') {
+      if (!diag.emptyFiles.includes(action.path)) noLongerReason = 'no longer an empty file';
+    } else if (action.kind === 'orphan') {
+      if (!diag.orphanCandidates.includes(action.path)) noLongerReason = 'no longer an orphan attachment candidate';
+    } else if (action.kind === 'duplicate') {
+      const keeper = action.keeper ?? null;
+      if (keeper === null || keeper === action.path) {
+        noLongerReason = 'no longer a duplicate of its keeper';
+      } else if (!isSafePlanPath(keeper)) {
+        noLongerReason = 'no longer a duplicate of its keeper';
+      } else {
+        let keeperExists = false;
+        try {
+          keeperExists = (await ctx.backend.stat(keeper)) !== null;
+        } catch {
+          keeperExists = false;
+        }
+        if (!keeperExists) {
+          noLongerReason = 'keeper no longer on disk';
+        } else if (!diag.duplicateGroups.some((g) => g.includes(action.path) && g.includes(keeper))) {
+          noLongerReason = 'no longer a duplicate of its keeper';
+        }
+      }
+    }
+    if (noLongerReason !== null) {
+      recordSkipped(action, noLongerReason);
+      continue;
+    }
+
+    try {
+      if (action.action === 'archive') {
+        const destRel = `archive/${action.path}`;
+        try {
+          await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, destRel);
+        } catch {
+          recordSkipped(action, 'archive destination not allowed for writing');
+          continue;
+        }
+        if (await ctx.backend.exists(destRel)) {
+          recordSkipped(action, 'archive destination already exists');
+          continue;
+        }
+        await ctx.backend.moveFile(action.path, destRel);
+        lines.push(`executed: ${action.action} ${action.path}`);
+        executed++;
+        executedPaths.push(action.path);
+      }
+    } catch (error) {
+      recordSkipped(action, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (options?.incrementalRefresh) {
+    for (const p of executedPaths) ctx.searchIndex.markDirty(p);
+  } else {
+    try {
+      const buildResult = await ctx.searchIndex.buildAll();
+      if (buildResult !== 'built') {
+        for (const p of executedPaths) ctx.searchIndex.markDirty(p);
+        lines.push(`warning: search index rebuild ${buildResult}; search results may be stale until the next rebuild.`);
+      }
+    } catch (error) {
+      for (const p of executedPaths) ctx.searchIndex.markDirty(p);
+      lines.push(`warning: search index rebuild failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const allSkipped = executed === 0 && skipped > 0;
+  lines.push(
+    `Applied plan ${planId}: ${executed} executed, ${skipped} skipped.` +
+      (allSkipped ? ' All actions were skipped; nothing was executed.' : ''),
+  );
+  return { lines, exitCode: allSkipped ? 1 : 0 };
 }
 
 function textBlock(text: string): TextContent {
@@ -125,6 +571,12 @@ function responseBudgetBytes(): number {
  * and the final total is re-checked before returning.
  */
 const DIRECT_IMAGE_HEADER_RESERVE_BYTES = 512;
+
+/**
+ * Hard upper bound on on-disk file size before reading a file into memory
+ * in read_file or edit_tags, preventing multi-GB files from exhausting RAM.
+ */
+const MAX_READ_FILE_BYTES = 256_000_000;
 
 /**
  * Assemble the text block of a read_file result so that
@@ -238,7 +690,7 @@ function searchOutputCapBytes(): number {
 }
 
 /** Format a read-only diagnostics report (0.9.0 maintenance preview; never modifies anything). */
-export function formatDiagnostics(diag: Diagnostics): string {
+export function formatDiagnostics(diag: Diagnostics, scope?: string): string {
   const lines: string[] = ['Library diagnostics (read-only — nothing was modified):', ''];
   lines.push(`Empty files (${diag.emptyFiles.length}):`);
   for (const f of diag.emptyFiles) {
@@ -251,6 +703,22 @@ export function formatDiagnostics(diag: Diagnostics): string {
   lines.push('', `Broken image references (${diag.brokenImageRefs.length}):`);
   for (const ref of diag.brokenImageRefs) {
     lines.push(`- ${ref.file}: ${ref.src}`);
+  }
+  if (diag.scanIncomplete) {
+    lines.push('', `Scan incomplete: ${diag.skippedNotes.length} note(s) could not be read, so the orphan list is withheld (this does NOT mean there are no orphans):`);
+    for (const n of diag.skippedNotes) {
+      lines.push(`- ${n.file} (${n.reason})`);
+    }
+    if (scope !== undefined && scope !== '') {
+      const outsideScope = diag.skippedNotes.filter(
+        (n) => n.file !== scope && !n.file.startsWith(`${scope}/`),
+      );
+      if (outsideScope.length > 0) {
+        lines.push(
+          `Note: ${outsideScope.length} of the skipped note(s) above lie outside the requested scope (${scope}), but a note anywhere in the library may reference an image inside the scope, so they still withhold the orphan list.`,
+        );
+      }
+    }
   }
   lines.push('', `Orphan attachment candidates (${diag.orphanCandidates.length}, unreferenced images older than 24h):`);
   for (const f of diag.orphanCandidates) {
@@ -296,7 +764,7 @@ export async function handleSearchFiles(
   // Read-only diagnostics (maintenance preview). Keyword is ignored.
   if (opts.diagnosticsOnly === true) {
     const diag = await ctx.searchIndex.scanDiagnostics(scopeRel);
-    return okResult(truncateUtf8(formatDiagnostics(diag), cap));
+    return okResult(truncateUtf8(formatDiagnostics(diag, scopeRel), cap));
   }
 
   if (keyword.trim() === '') {
@@ -326,7 +794,7 @@ export async function handleSearchFiles(
   // Kick off the background build on first use; searches fall back to
   // a direct scan until it finishes.
   if (ctx.searchIndex.getStatus() === 'unbuilt') {
-    void ctx.searchIndex.ensureReady();
+    void ctx.searchIndex.ensureReady().catch(() => undefined);
   }
 
   const limit = Math.min(
@@ -353,13 +821,15 @@ export async function handleSearchFiles(
     // type filter and pagination still apply; tags, dates, and the
     // exact phrase cannot be checked by a direct scan, and the
     // result says so instead of silently pretending they were.
-    const allHits = await ctx.backend.search(keyword, scopeRel, SEARCH_MAX_RESULTS);
     const wantedExts = (opts.fileTypes ?? []).map((e) =>
       e.startsWith('.') ? e.toLowerCase() : `.${e.toLowerCase()}`,
     );
-    const hits = wantedExts.length > 0
-      ? allHits.filter((h) => wantedExts.includes(path.extname(h).toLowerCase()))
-      : allHits;
+    const hits = await ctx.backend.search(
+      keyword,
+      scopeRel,
+      SEARCH_MAX_RESULTS,
+      wantedExts.length > 0 ? wantedExts : undefined,
+    );
     const ignored: string[] = [];
     if ((opts.tags ?? []).length > 0) {
       ignored.push('tags');
@@ -408,8 +878,9 @@ export async function handleSearchFiles(
       hitLines.push(`- ${hit} (${kind})${excerpt}`);
     }
     const headerFor = (shown: number): string[] => {
+      const showingSuffix = shown > 0 ? `; showing ${offset + 1}–${offset + shown}` : '';
       const lines = [
-        `Found ${hits.length} file(s) matching ${JSON.stringify(keyword)} under ${rel} (direct scan — search index is still building; showing ${offset + 1}–${offset + shown}):`,
+        `Found ${hits.length} file(s) matching ${JSON.stringify(keyword)} under ${rel} (direct scan — search index is still building${showingSuffix}):`,
         '',
       ];
       if (rebuildSkipped || rebuildFailed) {
@@ -445,8 +916,9 @@ export async function handleSearchFiles(
   });
   const fitted = fitSearchOutput(
     (shown) => {
+      const showingSuffix = shown > 0 ? ` (showing ${offset + 1}–${offset + shown})` : '';
       const header = [
-        `Found ${outcome.total} matching file(s) for ${JSON.stringify(keyword)} under ${rel} (showing ${offset + 1}–${offset + shown}):`,
+        `Found ${outcome.total} matching file(s) for ${JSON.stringify(keyword)} under ${rel}${showingSuffix}:`,
         '',
       ];
       if (rebuildSkipped || rebuildFailed) {
@@ -481,6 +953,15 @@ function fitSearchOutput(
   offset: number,
   cap: number,
 ): { text: string; shown: number } {
+  if (hitLines.length === 0 && total > 0) {
+    return {
+      text: truncateUtf8(
+        [...headerFor(0), `No more results: offset ${offset} is beyond the ${total} matching file(s).`].join('\n'),
+        cap,
+      ),
+      shown: 0,
+    };
+  }
   // Reserve for the longest plausible "More" line (largest offset);
   // the final line can only be shorter, so the total stays in budget.
   const reserve =
@@ -534,6 +1015,10 @@ const TAG_REMINDER_TIP =
 // itself is per-library, so the guard is keyed the same way).
 const tagTipShownCacheDirs = new Set<string>();
 
+export function escapeImageAlt(alt: string): string {
+  return alt.replace(/[\\\]]/g, '\\$&');
+}
+
 async function handleSaveFile(
   ctx: ToolContext,
   inputPath: string,
@@ -548,6 +1033,13 @@ async function handleSaveFile(
   const rel = relOf(ctx, absolute);
   if (rel === '.') {
     throw new MemDriveError('INVALID_PATH', 'save_file needs a file path, not the library root.');
+  }
+  const lowerRel = rel.toLowerCase();
+  if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `Cannot write into archive/ (${rel}). Use restore_file to bring it back first.`,
+    );
   }
   if (mode === 'new' && (await ctx.backend.exists(rel))) {
     throw new MemDriveError(
@@ -648,60 +1140,20 @@ async function handleSaveFile(
   let body = content;
   if (savedImages.length > 0 && MARKDOWN_EXTENSIONS.has(docExt)) {
     const refs = savedImages
-      .map((img) => `\n![${img.alt}](assets/${encodeImageSrc(img.fileName)})`)
+      .map((img) => `\n![${escapeImageAlt(img.alt)}](assets/${encodeImageSrc(img.fileName)})`)
       .join('');
     body += `${body.length > 0 && !body.endsWith('\n') ? '\n' : ''}${refs}\n`;
   }
 
   // 4. Write the document. On failure, remove any images just stored so
   //    no dangling references are left behind.
+  let created: boolean;
   try {
-    const { created } = await ctx.backend.writeFile(
+    ({ created } = await ctx.backend.writeFile(
       rel,
       Buffer.from(body, 'utf8'),
       mode,
-    );
-    // Tell the index the file changed: the next search refreshes
-    // before answering, so a just-saved note is searchable at once.
-    ctx.searchIndex.markDirty(rel);
-    const lines = [
-      `Saved ${rel} (${formatBytes(Buffer.byteLength(body, 'utf8'))}, mode: ${mode}${created ? ', created' : ''}).`,
-    ];
-    if (savedImages.length > 0) {
-      lines.push(`Images stored in assets/: ${savedImages.map((i) => i.fileName).join(', ')}.`);
-      if (!MARKDOWN_EXTENSIONS.has(docExt)) {
-        lines.push(
-          'No image references were appended because the file is not Markdown; the image paths above are the references to use.',
-        );
-      }
-    }
-    for (const note of notes) {
-      lines.push(`Note: ${note}`);
-    }
-    // One-time tag reminder per library cache dir (best-effort: a marker
-    // check or write failure must never fail the save). Note: the server
-    // can only append the tip and instruct the model in the tool description
-    // to relay it; it cannot guarantee the model actually says it every time.
-    try {
-      const cacheDir = resolveIndexCacheDir(ctx.rootRealDir);
-      const markerPath = path.join(cacheDir, TAG_REMINDER_MARKER);
-      let markerExists = false;
-      try {
-        await fs.access(markerPath);
-        markerExists = true;
-      } catch {
-        markerExists = false;
-      }
-      if (!markerExists && !tagTipShownCacheDirs.has(cacheDir)) {
-        tagTipShownCacheDirs.add(cacheDir);
-        lines.push(TAG_REMINDER_TIP);
-        await fs.mkdir(cacheDir, { recursive: true });
-        await fs.writeFile(markerPath, '', 'utf8');
-      }
-    } catch {
-      // Best-effort only; never fail a save over the reminder marker.
-    }
-    return okResult(lines.join('\n'));
+    ));
   } catch (error) {
     for (const img of savedImages) {
       try {
@@ -712,6 +1164,901 @@ async function handleSaveFile(
     }
     throw error;
   }
+  // Tell the index the file changed: the next search refreshes
+  // before answering, so a just-saved note is searchable at once.
+  ctx.searchIndex.markDirty(rel);
+  const lines = [
+    `Saved ${rel} (${formatBytes(Buffer.byteLength(body, 'utf8'))}, mode: ${mode}${created ? ', created' : ''}).`,
+  ];
+  if (savedImages.length > 0) {
+    lines.push(`Images stored in assets/: ${savedImages.map((i) => i.fileName).join(', ')}.`);
+    if (!MARKDOWN_EXTENSIONS.has(docExt)) {
+      lines.push(
+        'No image references were appended because the file is not Markdown; the image paths above are the references to use.',
+      );
+    }
+  }
+  for (const note of notes) {
+    lines.push(`Note: ${note}`);
+  }
+  // One-time tag reminder per library cache dir (best-effort: a marker
+  // check or write failure must never fail the save). Note: the server
+  // can only append the tip and instruct the model in the tool description
+  // to relay it; it cannot guarantee the model actually says it every time.
+  try {
+    const cacheDir = resolveIndexCacheDir(ctx.rootRealDir);
+    const markerPath = path.join(cacheDir, TAG_REMINDER_MARKER);
+    let markerExists = false;
+    try {
+      await fs.access(markerPath);
+      markerExists = true;
+    } catch {
+      markerExists = false;
+    }
+    if (!markerExists && !tagTipShownCacheDirs.has(cacheDir)) {
+      tagTipShownCacheDirs.add(cacheDir);
+      lines.push(TAG_REMINDER_TIP);
+      await fs.mkdir(cacheDir, { recursive: true });
+      await fs.writeFile(markerPath, '', 'utf8');
+    }
+  } catch {
+    // Best-effort only; never fail a save over the reminder marker.
+  }
+  return okResult(lines.join('\n'));
+}
+
+/* ------------------------------------------------------------------ */
+/* edit_tags                                                           */
+/* ------------------------------------------------------------------ */
+
+type TagLocation = 'front_matter' | 'body';
+type TagOperation = 'add' | 'remove' | 'rename';
+
+/** YAML front-matter block: `---` fence, body, `---` fence. */
+const FRONT_MATTER_RE = /^---\r?\n(?:([\s\S]*?)\r?\n)?---(?:\r?\n|$)/;
+
+/** Unescape a double-quoted YAML scalar's content in a single left-to-right pass. */
+function unescapeDoubleQuoted(inner: string): string {
+  let out = '';
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i] as string;
+    if (ch === '\\' && i + 1 < inner.length) {
+      const next = inner[i + 1] as string;
+      if (next === '\\' || next === '"') {
+        out += next;
+        i++;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Read a tag the way `extractTags` does (trim, strip surrounding
+ * quotes, strip a leading `#` marker, trim again) — without the
+ * lowercase step, so the stored case is preserved.
+ */
+function readTag(raw: string): string {
+  const trimmed = raw.trim();
+  // A matching pair of double quotes is a YAML double-quoted scalar:
+  // unescape it in ONE left-to-right pass (`\\` -> `\`, `\"` -> `"`).
+  // A single pass matters: two sequential passes would corrupt `\\"`
+  // into `"`. Any other `\x` is left intact, so a literal backslash
+  // in a hand-written `"a\b"` survives. A matching pair of single
+  // quotes is a YAML single-quoted scalar, where `\` is literal:
+  // strip the quotes without unescaping.
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return unescapeDoubleQuoted(trimmed.slice(1, -1)).replace(/^#+/, '').trim();
+  }
+  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replace(/^#+/, '').trim();
+  }
+  return trimmed.replace(/^['"]|['"]$/g, '').replace(/^#+/, '').trim();
+}
+
+/** A tag that can be stored in front matter without breaking the YAML or being dropped on read. */
+function isFrontMatterStorable(tag: string): boolean {
+  return (
+    tag.length > 0 &&
+    !/[\[\]{}"]/.test(tag) &&
+    !/^'|'$/.test(tag) &&
+    !/^#/.test(tag) &&
+    !/\s#/.test(tag) &&
+    !tag.includes(': ') &&
+    !tag.startsWith('-') &&
+    !tag.endsWith('\\')
+  );
+}
+
+function isQuotedStorable(tag: string): boolean {
+  if (tag.length === 0 || tag.includes('"')) {
+    return false;
+  }
+  for (const ch of tag) {
+    const code = ch.codePointAt(0) as number;
+    if (code < 0x20 && ch !== '\t') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** A tag that can appear as a body `#tag` (same shape `extractTags` accepts). */
+function isBodyTag(tag: string): boolean {
+  return /^[\p{L}\p{N}_][\p{L}\p{N}_/-]*$/u.test(tag) && /\p{L}/u.test(tag);
+}
+
+/** Split the bracketed contents of a flow list, respecting quoted items (`"a,b"` is one item). */
+function splitFlowItems(inner: string): string[] {
+  const items: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i] as string;
+    if (quote === '"') {
+      // Inside double quotes a backslash escapes the next character.
+      cur += ch;
+      if (ch === '\\' && i + 1 < inner.length) {
+        cur += inner[i + 1] as string;
+        i++;
+      } else if (ch === '"') {
+        quote = null;
+      }
+    } else if (quote !== null) {
+      cur += ch;
+      if (ch === quote) {
+        quote = null;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+    } else if (ch === ',') {
+      items.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  items.push(cur);
+  return items;
+}
+
+/** Quote a flow-list item when a comma or single quote inside it would break parsing on read. */
+function quoteFlowItem(item: string): string {
+  return item.includes(',') || item.includes("'")
+    ? '"' + item.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+    : item;
+}
+
+function quoteBlockItem(tag: string): string {
+  return isFrontMatterStorable(tag)
+    ? tag
+    : '"' + tag.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+/** The line ending of a line ('' when the line is the last one and has none). */
+function lineEnding(line: string): string {
+  if (line.endsWith('\r\n')) {
+    return '\r\n';
+  }
+  if (line.endsWith('\n')) {
+    return '\n';
+  }
+  return '';
+}
+
+/**
+ * The `tags:` entry of a front-matter body: which form it takes, the
+ * tags it holds, and the spans needed to rewrite just that entry.
+ * `lineIndex` and the block-item line indexes are indexes into the
+ * front-matter body's lines (split keeping each line ending).
+ */
+interface FmTagEntry {
+  form: 'flow' | 'block' | 'plain' | 'none';
+  /** Tags in order, as written (case preserved). */
+  tags: string[];
+  /** Index of the `tags:` line, or -1 when there is no `tags:` line. */
+  lineIndex: number;
+  /** Flow: the text after the closing `]` on the line. Plain: the trailing comment (from `#`) or ''. */
+  suffix: string;
+  /** Block: the `- item` lines that follow the `tags:` line. */
+  blockItems: FmBlockItem[];
+}
+
+interface FmBlockItem {
+  /** Index of the item line in the front-matter body's lines. */
+  lineIndex: number;
+  /** Leading whitespace of the line. */
+  indent: string;
+  /** The tag text as written ('' when the line holds only a comment). */
+  value: string;
+  /** Offset of the value within the line string. */
+  valueStart: number;
+  /** Offset just past the value within the line string. */
+  valueEnd: number;
+}
+
+function parseFmTags(fmBody: string): FmTagEntry {
+  const lines = fmBody.split(/(?<=\n)/);
+  const none: FmTagEntry = {
+    form: 'none',
+    tags: [],
+    lineIndex: -1,
+    suffix: '',
+    blockItems: [],
+  };
+  let lineIndex = -1;
+  let rest = '';
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^tags:([ \t]*)(.*)$/.exec((lines[i] as string).replace(/\r?\n$/, ''));
+    if (m !== null) {
+      lineIndex = i;
+      const leadWs = (m[1] as string) ?? '';
+      const afterWs = (m[2] as string) ?? '';
+      rest = afterWs.startsWith('#') ? `${leadWs || ' '}${afterWs}` : afterWs;
+      break;
+    }
+  }
+  if (lineIndex === -1) {
+    return none;
+  }
+  const value = rest.trim();
+  if (value.startsWith('[')) {
+    // Flow list. A `#` inside the brackets is a tag character, not
+    // a comment — only a `#` after the closing `]` starts one (same
+    // rule `extractTags` uses).
+    const bracket = /^\[((?:[^\]"']|"(?:\\.|[^"\\])*"|'[^']*')*)\]/.exec(value);
+    if (bracket === null) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        'The tags line could not be parsed (unclosed "["); fix it manually and retry.',
+      );
+    }
+    const tags = splitFlowItems(bracket[1] as string)
+      .map((p) => readTag(p))
+      .filter((t) => t.length > 0);
+    if (tags.some((t) => !isFrontMatterStorable(t))) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+      );
+    }
+    return {
+      form: 'flow',
+      tags,
+      lineIndex,
+      suffix: value.slice((bracket[0] as string).length),
+      blockItems: [],
+    };
+  }
+  // Block list: the `tags:` line has no value (or only a comment)
+  // and `- item` lines follow it. Blank lines inside the block are
+  // skipped; the first non-blank, non-item line ends it.
+  if (value === '' || value.startsWith('#')) {
+    const blockItems: FmBlockItem[] = [];
+    for (let i = lineIndex + 1; i < lines.length; i++) {
+      const rawLine = lines[i] as string;
+      const content = rawLine.replace(/\r?\n$/, '');
+      if (content.trim() === '') {
+        continue;
+      }
+      const m = /^([ \t]*)-(?:[ \t]+(.*))?$/.exec(content);
+      if (m === null) {
+        break;
+      }
+      const indent = m[1] as string;
+      const itemText = ((m[2] as string | undefined) ?? '');
+      if (itemText === '') {
+        blockItems.push({
+          lineIndex: i,
+          indent,
+          value: '',
+          valueStart: content.length,
+          valueEnd: content.length,
+        });
+        continue;
+      }
+      const leadSpaces = itemText.length - itemText.trimStart().length;
+      const trimmedItem = itemText.slice(leadSpaces);
+      const valueStart = content.indexOf(itemText, indent.length + 1) + leadSpaces;
+      // A trailing YAML comment (`- alpha # c1`) is not part of the
+      // tag; the `#` must start the value or follow whitespace outside quotes.
+      let quote: string | null = null;
+      let commentIdx = -1;
+      for (let j = 0; j < trimmedItem.length; j++) {
+        const ch = trimmedItem[j] as string;
+        if (quote !== null) {
+          // Inside double quotes a backslash escapes the next
+          // character, so `\"` does not close the quote.
+          if (quote === '"' && ch === '\\') {
+            j++;
+          } else if (ch === quote) {
+            quote = null;
+          }
+        } else if ((ch === '"' || ch === "'") && j === 0) {
+          // A quote only opens a quoted scalar at the start of the
+          // value (YAML rule): a quote mid-value (the `'` in
+          // `Bob's idea`) is an ordinary character, so a later `#`
+          // still starts a comment.
+          quote = ch;
+        } else if (
+          ch === '#' &&
+          (j === 0 || trimmedItem[j - 1] === ' ' || trimmedItem[j - 1] === '\t')
+        ) {
+          commentIdx = j;
+          break;
+        }
+      }
+      const rawValue = (commentIdx === -1 ? trimmedItem : trimmedItem.slice(0, commentIdx)).trimEnd();
+      blockItems.push({
+        lineIndex: i,
+        indent,
+        value: readTag(rawValue),
+        valueStart: rawValue.length === 0 ? content.length : valueStart,
+        valueEnd: rawValue.length === 0 ? content.length : valueStart + rawValue.length,
+      });
+    }
+    if (blockItems.length > 0) {
+      const tags = blockItems.map((b) => b.value).filter((t) => t.length > 0);
+      if (tags.some((t) => !isFrontMatterStorable(t) && !isQuotedStorable(t))) {
+        throw new MemDriveError(
+          'INVALID_ARGUMENT',
+          'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+        );
+      }
+      return {
+        form: 'block',
+        tags,
+        lineIndex,
+        suffix: '',
+        blockItems,
+      };
+    }
+    // Empty `tags:` with no items: a plain empty value (a comment
+    // after it is preserved as the suffix).
+    return {
+      form: 'plain',
+      tags: [],
+      lineIndex,
+      suffix: value.startsWith('#') ? rest : '',
+      blockItems: [],
+    };
+  }
+  // Plain value: comma-separated, with an optional trailing comment.
+  const commentMatch = /(^|\s)#/.exec(rest);
+  const itemsPart =
+    commentMatch === null
+      ? rest
+      : rest.slice(0, commentMatch.index);
+  const suffix =
+    commentMatch === null
+      ? ''
+      : (commentMatch[1] === '' ? ' ' : '') +
+        rest.slice(commentMatch.index);
+  const tags = itemsPart
+    .split(',')
+    .map((p) => readTag(p))
+    .filter((t) => t.length > 0);
+  if (tags.some((t) => !isFrontMatterStorable(t))) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+    );
+  }
+  return { form: 'plain', tags, lineIndex, suffix, blockItems: [] };
+}
+
+/** Format a plain `tags:` line, upgrading to flow syntax if any item contains a comma. */
+function formatPlainTagsLine(items: string[], suffix: string, eol: string): string {
+  if (items.length === 0) {
+    return `tags:${suffix}${eol}`;
+  }
+  if (items.some((t) => t.includes(','))) {
+    return `tags: [${items.map(quoteFlowItem).join(', ')}]${suffix}${eol}`;
+  }
+  return `tags: ${items.join(', ')}${suffix}${eol}`;
+}
+
+/**
+ * Apply one tag operation to a front-matter body. Returns the new
+ * body, or null when the operation is a no-op (the tag is already
+ * there, the tag is not there, or the new name already exists).
+ * Only the `tags:` entry changes; every other line is untouched.
+ * Throws INVALID_ARGUMENT when the `tags:` line cannot be parsed
+ * safely.
+ */
+function editFrontMatterTags(
+  fmBody: string,
+  operation: TagOperation,
+  tag: string,
+  newTag: string | undefined,
+  eol: string,
+): string | null {
+  const entry = parseFmTags(fmBody);
+  const lower = tag.toLowerCase();
+  const lines = fmBody.split(/(?<=\n)/);
+  if (operation === 'add') {
+    if (entry.tags.some((t) => t.toLowerCase() === lower)) {
+      return null;
+    }
+    if (entry.form === 'none') {
+      // No `tags:` line: insert one right after the opening fence.
+      return `tags: [${quoteFlowItem(tag)}]${eol}${fmBody}`;
+    }
+    if (entry.form === 'flow') {
+      const items = [...entry.tags, tag];
+      lines[entry.lineIndex] =
+        `tags: [${items.map(quoteFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
+      return lines.join('');
+    }
+    if (entry.form === 'block') {
+      const last = entry.blockItems[entry.blockItems.length - 1] as FmBlockItem;
+      const lastHadEnding = (lines[last.lineIndex] as string).endsWith('\n');
+      // The last item line may be the last line of the front matter
+      // (no ending): give it one first, or the insert runs together.
+      if (!((lines[last.lineIndex] as string).endsWith('\n'))) {
+        lines[last.lineIndex] = `${lines[last.lineIndex] as string}${eol}`;
+      }
+      lines.splice(
+        last.lineIndex + 1,
+        0,
+        lastHadEnding ? `${last.indent}- ${quoteBlockItem(tag)}${eol}` : `${last.indent}- ${quoteBlockItem(tag)}`,
+      );
+      return lines.join('');
+    }
+    // Plain value (possibly empty): rebuild the line.
+    const items = [...entry.tags, tag];
+    lines[entry.lineIndex] = formatPlainTagsLine(
+      items,
+      entry.suffix,
+      lineEnding(lines[entry.lineIndex] as string),
+    );
+    return lines.join('');
+  }
+  if (operation === 'remove') {
+    if (!entry.tags.some((t) => t.toLowerCase() === lower)) {
+      return null;
+    }
+    if (entry.form === 'flow') {
+      const items = entry.tags.filter((t) => t.toLowerCase() !== lower);
+      lines[entry.lineIndex] =
+        `tags: [${items.map(quoteFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
+      return lines.join('');
+    }
+    if (entry.form === 'block') {
+      const matches = entry.blockItems.filter((b) => b.value.toLowerCase() === lower);
+      if (matches.length === 0) {
+        return null;
+      }
+      for (let i = matches.length - 1; i >= 0; i--) {
+        const item = matches[i] as FmBlockItem;
+        const wasLastNoEnding =
+          item.lineIndex === lines.length - 1 &&
+          !((lines[item.lineIndex] as string).endsWith('\n'));
+        lines.splice(item.lineIndex, 1);
+        if (wasLastNoEnding && lines.length > 0) {
+          // Removing the last line must not leave a stray blank line
+          // before the closing fence: drop the new last line's ending.
+          const prev = lines[lines.length - 1] as string;
+          lines[lines.length - 1] = prev.replace(/\r?\n$/, '');
+        }
+      }
+      return lines.join('');
+    }
+    const items = entry.tags.filter((t) => t.toLowerCase() !== lower);
+    lines[entry.lineIndex] = formatPlainTagsLine(
+      items,
+      entry.suffix,
+      lineEnding(lines[entry.lineIndex] as string),
+    );
+    return lines.join('');
+  }
+  // Rename.
+  const newLower = (newTag as string).toLowerCase();
+  if (!entry.tags.some((t) => t.toLowerCase() === lower)) {
+    return null;
+  }
+  if (entry.tags.some((t) => t.toLowerCase() === newLower)) {
+    return null;
+  }
+  if (entry.form === 'flow') {
+    const items = entry.tags.map((t) =>
+      t.toLowerCase() === lower ? (newTag as string) : t,
+    );
+    lines[entry.lineIndex] =
+      `tags: [${items.map(quoteFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
+    return lines.join('');
+  }
+  if (entry.form === 'block') {
+    const matches = entry.blockItems.filter((b) => b.value.toLowerCase() === lower);
+    if (matches.length === 0) {
+      return null;
+    }
+    for (const item of matches) {
+      const line = lines[item.lineIndex] as string;
+      lines[item.lineIndex] =
+        line.slice(0, item.valueStart) + quoteBlockItem(newTag as string) + line.slice(item.valueEnd);
+    }
+    return lines.join('');
+  }
+  const items = entry.tags.map((t) =>
+    t.toLowerCase() === lower ? (newTag as string) : t,
+  );
+  lines[entry.lineIndex] = formatPlainTagsLine(
+    items,
+    entry.suffix,
+    lineEnding(lines[entry.lineIndex] as string),
+  );
+  return lines.join('');
+}
+
+/** One `#tag` occurrence in body text, with body-relative spans. */
+interface BodyTagMatch {
+  tag: string;
+  /** Offset of the `#`. */
+  hashIndex: number;
+  /** Offset of the tag text (just after the `#`). */
+  tagStart: number;
+  /** Offset just past the tag text. */
+  tagEnd: number;
+  /** Offset of the line the match is on (including its line ending). */
+  lineStart: number;
+  /** Offset just past the line (including its line ending). */
+  lineEnd: number;
+}
+
+/**
+ * Find `#tag` occurrences in body text, excluding fenced code blocks
+ * and inline code — the same rules `extractTags` uses, with offsets
+ * preserved so the matches can be edited in place.
+ */
+function scanBodyTags(body: string): BodyTagMatch[] {
+  const out: BodyTagMatch[] = [];
+  const lines = body.split(/(?<=\n)/);
+  let offset = 0;
+  let fence: { ch: string; len: number } | null = null;
+  for (const line of lines) {
+    const lineStart = offset;
+    offset += line.length;
+    const content = line.replace(/\r?\n$/, '');
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
+    if (fence === null) {
+      // A backtick fence's info string may not contain a backtick.
+      if (m !== null && !(m[1]![0] === '`' && m[2]!.includes('`'))) {
+        fence = { ch: m[1]![0]!, len: m[1]!.length };
+        continue;
+      }
+    } else if (
+      m !== null &&
+      m[1]![0] === fence.ch &&
+      m[1]!.length >= fence.len &&
+      m[2]!.trim() === ''
+    ) {
+      fence = null;
+      continue;
+    }
+    if (fence !== null) {
+      continue;
+    }
+    // Mask inline code with equal-length spaces so offsets survive.
+    const scanned = content.replace(
+      /(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g,
+      (match) => ' '.repeat(match.length),
+    );
+    for (const match of scanned.matchAll(
+      /(?:^|\s)#([\p{L}\p{N}_][\p{L}\p{N}_/-]*)/gu,
+    )) {
+      const tag = match[1] as string;
+      if (!/\p{L}/u.test(tag)) {
+        continue;
+      }
+      const hashInLine =
+        (match.index as number) + (match[0] as string).indexOf('#');
+      out.push({
+        tag,
+        hashIndex: lineStart + hashInLine,
+        tagStart: lineStart + hashInLine + 1,
+        tagEnd: lineStart + hashInLine + 1 + tag.length,
+        lineStart,
+        lineEnd: lineStart + line.length,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Apply one tag operation to body text. Returns the new body, or
+ * null when the operation is a no-op. Adding appends `#tag` on its
+ * own line at the end of the file; removing drops a tag-only line
+ * whole and otherwise removes the token plus one adjacent space, so
+ * no double space is left behind; renaming replaces every
+ * occurrence. Nothing else in the body changes.
+ */
+function editBodyTags(
+  body: string,
+  operation: TagOperation,
+  tag: string,
+  newTag: string | undefined,
+  eol: string,
+): string | null {
+  const lower = tag.toLowerCase();
+  const found = scanBodyTags(body);
+  if (operation === 'add') {
+    if (found.some((f) => f.tag.toLowerCase() === lower)) {
+      return null;
+    }
+    const sep = body.length === 0 ? '' : body.endsWith('\n') ? '' : eol;
+    return `${body}${sep}#${tag}${eol}`;
+  }
+  const targets = found.filter((f) => f.tag.toLowerCase() === lower);
+  if (targets.length === 0) {
+    return null;
+  }
+  if (operation === 'rename') {
+    const newLower = (newTag as string).toLowerCase();
+    if (found.some((f) => f.tag.toLowerCase() === newLower)) {
+      return null;
+    }
+  }
+  const lines = body.split(/(?<=\n)/);
+  const lineStarts: number[] = [];
+  let off = 0;
+  for (const line of lines) {
+    lineStarts.push(off);
+    off += line.length;
+  }
+  const byLine = new Map<number, BodyTagMatch[]>();
+  for (const t of targets) {
+    const idx = lineStarts.indexOf(t.lineStart);
+    if (!byLine.has(idx)) {
+      byLine.set(idx, []);
+    }
+    (byLine.get(idx) as BodyTagMatch[]).push(t);
+  }
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const ts = byLine.get(i);
+    if (ts === undefined) {
+      out.push(line);
+      continue;
+    }
+    const ls = lineStarts[i] as number;
+    if (operation === 'rename') {
+      let newLine = line;
+      const sorted = [...ts].sort((a, b) => b.tagStart - a.tagStart);
+      for (const t of sorted) {
+        const s = t.tagStart - ls;
+        const e = t.tagEnd - ls;
+        newLine = newLine.slice(0, s) + (newTag as string) + newLine.slice(e);
+      }
+      out.push(newLine);
+      continue;
+    }
+    // Remove: right-to-left, token plus one adjacent space.
+    let newLine = line;
+    const sorted = [...ts].sort((a, b) => b.hashIndex - a.hashIndex);
+    for (const t of sorted) {
+      const hs = t.hashIndex - ls;
+      const te = t.tagEnd - ls;
+      const contentEnd = newLine.replace(/\r?\n$/, '').length;
+      if (
+        te < contentEnd &&
+        (newLine[te] === ' ' || newLine[te] === '\t')
+      ) {
+        newLine = newLine.slice(0, hs) + newLine.slice(te + 1);
+      } else if (
+        hs > 0 &&
+        (newLine[hs - 1] === ' ' || newLine[hs - 1] === '\t')
+      ) {
+        newLine = newLine.slice(0, hs - 1) + newLine.slice(te);
+      } else {
+        newLine = newLine.slice(0, hs) + newLine.slice(te);
+      }
+    }
+    // A line left with nothing but whitespace was a tag-only line:
+    // drop it whole instead of leaving a blank line behind.
+    if (newLine.replace(/\r?\n$/, '').trim() === '') {
+      if (i === lines.length - 1 && !line.endsWith('\n') && out.length > 0) {
+        const prev = out[out.length - 1] as string;
+        out[out.length - 1] = prev.replace(/\r?\n$/, '');
+      }
+      continue;
+    }
+    out.push(newLine);
+  }
+  return out.join('');
+}
+
+/** The tags a file carries in one location (lowercased, deduplicated, in order). */
+function locationTags(text: string, location: TagLocation): string[] {
+  const fm = FRONT_MATTER_RE.exec(text);
+  if (location === 'front_matter') {
+    if (fm === null || fm[1] === undefined) {
+      return [];
+    }
+    return [
+      ...new Set(parseFmTags(fm[1] as string).tags.map((t) => t.toLowerCase())),
+    ];
+  }
+  const body = fm === null ? text : text.slice(fm.index + (fm[0] as string).length);
+  return [...new Set(scanBodyTags(body).map((m) => m.tag.toLowerCase()))];
+}
+
+async function handleEditTags(
+  ctx: ToolContext,
+  inputPath: string,
+  operation: TagOperation,
+  tag: string,
+  newTag: string | undefined,
+  location: TagLocation,
+): Promise<CallToolResult> {
+  // Writes get the cross-platform segment check, like save_file.
+  const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
+  const rel = relOf(ctx, absolute);
+  if (rel === '.') {
+    throw new MemDriveError(
+      'INVALID_PATH',
+      'edit_tags needs a file path, not the library root.',
+    );
+  }
+  const lowerRel = rel.toLowerCase();
+  if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `Cannot edit a file inside archive/ (${rel}). Use restore_file to bring it back first.`,
+    );
+  }
+  const stat = await ctx.backend.stat(rel);
+  if (stat === null) {
+    throw new NotFoundError(`File not found: ${rel}`);
+  }
+  if (stat.isDirectory) {
+    throw new MemDriveError(
+      'NOT_A_FILE',
+      `${rel} is a directory. Use list_directory to see its contents.`,
+    );
+  }
+  if (stat.size > MAX_READ_FILE_BYTES) {
+    throw new MemDriveError(
+      'FILE_TOO_LARGE',
+      `${rel} is too large to edit (${formatBytes(stat.size)}; limit is ${formatBytes(MAX_READ_FILE_BYTES)}).`,
+    );
+  }
+  const data = await ctx.backend.readFile(rel);
+  if (looksBinary(data)) {
+    throw new MemDriveError(
+      'BINARY_FILE',
+      `${rel} looks like a binary file (not text, image, or SVG). MemDrive reads text and images only.`,
+    );
+  }
+  const hasBom =
+    data.length >= 3 &&
+    data[0] === 0xef &&
+    data[1] === 0xbb &&
+    data[2] === 0xbf;
+  const text = decodeText(data, rel);
+  const cleanTag = tag.trim().replace(/^#+/, '').trim();
+  if (cleanTag.length === 0 || /[\r\n]/.test(cleanTag)) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      'Provide a tag name (without the leading "#").',
+    );
+  }
+  let cleanNew: string | undefined;
+  if (operation === 'rename') {
+    if (newTag === undefined) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        'Renaming a tag needs new_tag.',
+      );
+    }
+    cleanNew = newTag.trim().replace(/^#+/, '').trim();
+    if (cleanNew.length === 0 || /[\r\n]/.test(cleanNew)) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        'Provide a new tag name (without the leading "#").',
+      );
+    }
+  }
+  // What gets written is validated strictly; what is looked up is
+  // lenient (a tag that cannot be there is simply not there).
+  if (location === 'front_matter') {
+    if (operation === 'add' && !isFrontMatterStorable(cleanTag)) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        `Tag ${JSON.stringify(cleanTag)} cannot be stored in front matter (it contains [, ], {, }, ", leading/trailing ', leading #, or whitespace followed by #).`,
+      );
+    }
+    if (cleanNew !== undefined && !isFrontMatterStorable(cleanNew)) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        `Tag ${JSON.stringify(cleanNew)} cannot be stored in front matter (it contains [, ], {, }, ", leading/trailing ', leading #, or whitespace followed by #).`,
+      );
+    }
+  } else {
+    if (operation === 'add' && !isBodyTag(cleanTag)) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        `Tag ${JSON.stringify(cleanTag)} is not a valid body #tag (letters, digits, _, / and - only, cannot start with -, and must contain a letter).`,
+      );
+    }
+    if (cleanNew !== undefined && !isBodyTag(cleanNew)) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        `Tag ${JSON.stringify(cleanNew)} is not a valid body #tag (letters, digits, _, / and - only, cannot start with -, and must contain a letter).`,
+      );
+    }
+  }
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const locLabel = location === 'front_matter' ? 'front matter' : 'body';
+  const beforeTags = locationTags(text, location);
+  const fm = FRONT_MATTER_RE.exec(text);
+  let newText: string | null = null;
+  if (location === 'front_matter') {
+    if (fm === null) {
+      // No front matter: only adding creates one (a minimal block).
+      if (operation === 'add') {
+        newText = `---${eol}tags: [${quoteFlowItem(cleanTag)}]${eol}---${eol}${text}`;
+      }
+    } else if (fm[1] === undefined) {
+      // Empty `---\n---` front matter: insert the tags line between the fences.
+      if (operation === 'add') {
+        const bodyStart = text.indexOf('\n') + 1;
+        newText = `${text.slice(0, bodyStart)}tags: [${quoteFlowItem(cleanTag)}]${eol}${text.slice(bodyStart)}`;
+      }
+    } else {
+      const fmBody = fm[1] as string;
+      const bodyStart = text.indexOf('\n') + 1;
+      const bodyEnd = bodyStart + fmBody.length;
+      const edited = editFrontMatterTags(fmBody, operation, cleanTag, cleanNew, eol);
+      if (edited !== null) {
+        newText = text.slice(0, bodyStart) + edited + text.slice(bodyEnd);
+      }
+    }
+  } else {
+    const bodyStart = fm === null ? 0 : fm.index + (fm[0] as string).length;
+    const body = text.slice(bodyStart);
+    const edited = editBodyTags(body, operation, cleanTag, cleanNew, eol);
+    if (edited !== null) {
+      const prefix = text.slice(0, bodyStart);
+      const sep = prefix.length > 0 && !prefix.endsWith('\n') ? eol : '';
+      newText = prefix + sep + edited;
+    }
+  }
+  const tagList = (tags: string[]): string =>
+    tags.length > 0 ? tags.join(', ') : '(none)';
+  if (newText === null) {
+    let reason: string;
+    if (operation === 'add') {
+      reason = `"${cleanTag}" is already in the ${locLabel} tags of ${rel}`;
+    } else if (operation === 'remove') {
+      reason = `"${cleanTag}" is not in the ${locLabel} tags of ${rel}`;
+    } else if (!beforeTags.includes(cleanTag.toLowerCase())) {
+      reason = `"${cleanTag}" is not in the ${locLabel} tags of ${rel}`;
+    } else {
+      reason = `"${cleanNew as string}" is already in the ${locLabel} tags of ${rel}, so "${cleanTag}" was not renamed`;
+    }
+    return okResult(`No change: ${reason}. Tags now: ${tagList(beforeTags)}.`);
+  }
+  const outText = hasBom ? `\uFEFF${newText}` : newText;
+  await ctx.backend.writeFile(rel, Buffer.from(outText, 'utf8'), 'overwrite');
+  // Tell the index the file changed: the next search refreshes
+  // before answering, so the new tags are searchable at once.
+  ctx.searchIndex.markDirty(rel);
+  const afterTags = locationTags(newText, location);
+  const verb =
+    operation === 'add'
+      ? `added "${cleanTag}"`
+      : operation === 'remove'
+        ? `removed "${cleanTag}"`
+        : `renamed "${cleanTag}" to "${cleanNew as string}"`;
+  return okResult(
+    `Updated tags in ${rel} (${locLabel}): ${verb}. Tags now: ${tagList(afterTags)}.`,
+  );
 }
 
 /**
@@ -729,7 +2076,18 @@ async function resolveImageAbs(
   ref: MarkdownImageRef,
 ): Promise<{ abs: string } | { reason: string }> {
   if (ref.kind === 'obsidian') {
-    const resolved = await ctx.searchIndex.resolveNoteImageRef(noteRel, ref);
+    const resolved = await ctx.searchIndex
+      .resolveNoteImageRef(noteRel, ref)
+      .catch((error: unknown) => {
+        // A backend stat failure (EACCES/EIO) must not fail the whole
+        // note read: report the image as skipped with a reason, the
+        // same way a broken ref is reported.
+        const message = error instanceof Error ? error.message : String(error);
+        return { reason: message };
+      });
+    if ('reason' in resolved) {
+      return resolved;
+    }
     if (resolved.status === 'ok') {
       return { abs: path.resolve(ctx.rootDir, ...resolved.path.split('/')) };
     }
@@ -738,18 +2096,36 @@ async function resolveImageAbs(
     }
     return { reason: 'not found in the library' };
   }
-  // Non-Obsidian refs resolve relative to the note's directory.
-  // Normalize backslashes first (same as resolveImageRef): a note
-  // synced from Windows carries `assets\pic.png`, and on
-  // macOS/Linux `path.resolve` treats `\` as an ordinary filename
-  // character, so the image would report ENOENT while diagnostics
-  // (which normalizes) calls it valid.
+  // Non-Obsidian refs resolve relative to the note's directory, or
+  // from the library root when they start with `/`. Normalize
+  // backslashes first (same as resolveImageRef): a note synced from
+  // Windows carries `assets\pic.png`, and on macOS/Linux
+  // `path.resolve` treats `\` as an ordinary filename character, so
+  // the image would report ENOENT while diagnostics (which
+  // normalizes) calls it valid.
   const src = ref.src.replace(/\\/g, '/');
-  return {
-    abs: path.isAbsolute(src)
-      ? path.resolve(src)
-      : path.resolve(path.dirname(noteAbs), src),
-  };
+  const decoded = decodeUserPath(src);
+  const toAbs = (p: string): string =>
+    p.startsWith('/')
+      ? path.resolve(ctx.rootDir, ...p.replace(/^\/+/, '').split('/'))
+      : path.resolve(path.dirname(noteAbs), p);
+  // Prefer the literal path when it exists (a file can legitimately
+  // contain `%` in its name); otherwise use the decoded form.
+  if (decoded !== src) {
+    const rawAbs = toAbs(src);
+    try {
+      const rawRel = relOf(ctx, rawAbs);
+      if (
+        isInside(ctx.rootDir, rawAbs) &&
+        (await ctx.backend.exists(rawRel === '.' ? '' : rawRel))
+      ) {
+        return { abs: rawAbs };
+      }
+    } catch {
+      // Fall through to the decoded form.
+    }
+  }
+  return { abs: toAbs(decoded) };
 }
 
 /* ------------------------------------------------------------------ */
@@ -778,6 +2154,12 @@ async function handleReadFile(
     throw new MemDriveError(
       'NOT_A_FILE',
       `${rel} is a directory. Use list_directory to see its contents.`,
+    );
+  }
+  if (stat.size > MAX_READ_FILE_BYTES) {
+    throw new MemDriveError(
+      'FILE_TOO_LARGE',
+      `${rel} is too large to read (${formatBytes(stat.size)}; limit is ${formatBytes(MAX_READ_FILE_BYTES)}).`,
     );
   }
   const data = await ctx.backend.readFile(rel === '.' ? '' : rel);
@@ -934,6 +2316,7 @@ async function handleReadFile(
     // Markdown, bundled read: text plus every locally-referenced
     // image that fits the remaining budget, in reference order.
     const imageBlocks: ImageContent[] = [];
+    const seenImageRels = new Set<string>();
     let imageBase64Total = 0;
     let included = 0;
     const runningTextBytes = utf8Bytes(body);
@@ -957,6 +2340,25 @@ async function handleReadFile(
         }
         await assertInsideRealRoot(ctx.rootRealDir, imageAbs);
         const imageRel = relOf(ctx, imageAbs);
+        if (seenImageRels.has(imageRel)) {
+          continue;
+        }
+        seenImageRels.add(imageRel);
+        const imageStat = await ctx.backend.stat(imageRel === '.' ? '' : imageRel);
+        if (imageStat === null) {
+          notes.push(`Skipped image ${ref.src}: it is no longer on disk.`);
+          continue;
+        }
+        if (imageStat.isDirectory) {
+          notes.push(`Skipped image ${ref.src}: it is a directory, not a file.`);
+          continue;
+        }
+        if (imageStat.size > MAX_READ_FILE_BYTES) {
+          notes.push(
+            `Skipped image ${ref.src}: it is too large to read (${formatBytes(imageStat.size)}; limit is ${formatBytes(MAX_READ_FILE_BYTES)}).`,
+          );
+          continue;
+        }
         const imageData = await ctx.backend.readFile(imageRel === '.' ? '' : imageRel);
         const imageExt = path.extname(imageAbs).toLowerCase();
         const mimeType =
@@ -1043,6 +2445,9 @@ function decodeText(data: Buffer, rel: string): string {
 
 /** Truncate text to a byte budget without splitting a UTF-8 sequence. */
 function truncateUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) {
+    return '';
+  }
   const encoded = new TextEncoder().encode(text);
   if (encoded.length <= maxBytes) {
     return text;
@@ -1191,6 +2596,103 @@ const SAVE_GUIDANCE = [
   'in the conversation, through you.',
 ].join('\n');
 
+async function handleArchiveFile(
+  ctx: ToolContext,
+  inputPath: string,
+): Promise<CallToolResult> {
+  const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
+  const rel = relOf(ctx, absolute);
+  if (rel === '.') {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      'archive_file needs a file path, not the library root.',
+    );
+  }
+  // [Issue 6] Case-insensitive check for top-level archive/
+  const lowerRel = rel.toLowerCase();
+  if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      lowerRel === 'archive'
+        ? 'Cannot archive the archive folder itself.'
+        : `${rel} is already in archive/.`,
+    );
+  }
+  const stat = await ctx.backend.stat(rel);
+  if (stat === null) {
+    throw new NotFoundError(`File not found: ${rel}`);
+  }
+  if (stat.isDirectory) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `${rel} is a directory. Only files can be archived.`,
+    );
+  }
+  const destRel = `archive/${rel}`;
+  const destAbsolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, destRel);
+  const cleanDestRel = relOf(ctx, destAbsolute);
+  if (await ctx.backend.exists(cleanDestRel)) {
+    throw new MemDriveError(
+      'ALREADY_EXISTS',
+      `Archive destination already exists: ${cleanDestRel}. Refusing to overwrite.`,
+    );
+  }
+  await ctx.backend.moveFile(rel, cleanDestRel);
+  ctx.searchIndex.markDirty(rel);
+  return okResult(`Archived ${rel} to ${cleanDestRel}.`);
+}
+
+async function handleRestoreFile(
+  ctx: ToolContext,
+  inputPath: string,
+): Promise<CallToolResult> {
+  const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
+  const rel = relOf(ctx, absolute);
+  // [Issue 6] Case-insensitive check for top-level archive/
+  const lowerRel = rel.toLowerCase();
+  if (!lowerRel.startsWith('archive/')) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `restore_file requires a file inside archive/ (got ${rel}).`,
+    );
+  }
+  const destRel = rel.slice('archive/'.length);
+  if (destRel.length === 0) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      'restore_file needs a file path inside archive/, not archive/ itself.',
+    );
+  }
+  const stat = await ctx.backend.stat(rel);
+  if (stat === null) {
+    throw new NotFoundError(`File not found: ${rel}`);
+  }
+  if (stat.isDirectory) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `${rel} is a directory. Only files can be restored.`,
+    );
+  }
+  const destAbsolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, destRel);
+  const cleanDestRel = relOf(ctx, destAbsolute);
+  const lowerDestRel = cleanDestRel.toLowerCase();
+  if (lowerDestRel === 'archive' || lowerDestRel.startsWith('archive/')) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `Cannot restore ${rel} into archive/ (${cleanDestRel}).`,
+    );
+  }
+  if (await ctx.backend.exists(cleanDestRel)) {
+    throw new MemDriveError(
+      'ALREADY_EXISTS',
+      `Destination already exists: ${cleanDestRel}. Refusing to overwrite.`,
+    );
+  }
+  await ctx.backend.moveFile(rel, cleanDestRel);
+  ctx.searchIndex.markDirty(cleanDestRel);
+  return okResult(`Restored ${rel} to ${cleanDestRel}.`);
+}
+
 export function registerTools(
   server: McpServer,
   backend: StorageBackend,
@@ -1248,6 +2750,7 @@ export function registerTools(
         'diagnostics_only returns a read-only library report (empty files, duplicate content, broken image references, unreferenced attachments older than 24h) and never modifies anything; keyword is not needed for it. rebuild_index forces a full index rebuild first (use after a bulk import or a cache clear).',
         'On the first search after startup the index may still be building in the background; the result then says so and falls back to a direct scan (keyword, path, and file types only — tags, dates, and exact_phrase are not applied there, and the result says so).',
         'Paths are relative to the library root (MEMDRIVE_ROOT). Omit path or pass "" to search the whole library.',
+        'Files under the top-level archive/ folder are excluded from search_files — whole-library search and an explicit path: "archive" search both return nothing for them — while list_directory still shows archive/ so archived files remain inspectable.',
       ].join('\n'),
       inputSchema: {
         keyword: z
@@ -1371,6 +2874,141 @@ export function registerTools(
       wrap(() =>
         handleSaveFile(ctx, args.path, args.content, args.mode ?? 'new', args.images),
       ),
+  );
+
+  server.registerTool(
+    'edit_tags',
+    {
+      description: [
+        'Edit the tags on an existing note: add one tag, remove one tag, or rename one tag. One operation per call.',
+        'Tags live in two places: YAML front matter `tags:` (inline `[a, b]` or block `- a`) and body `#tag`s. The location parameter picks which one to edit (default front_matter).',
+        'Only the tag lines change: the rest of the file is left byte-for-byte identical (no reflow, no other front-matter field touched). Adding a tag to a note with no front matter creates a minimal `---\\ntags: [tag]\\n---` block at the top; adding a body tag appends `#tag` on its own line at the end of the file.',
+        'No-ops are not errors: adding a tag that is already there, removing one that is not there, and renaming to a name that already exists all succeed with a "No change" result. Tag names are case-insensitive.',
+        'The search index is updated at once, so the note is searchable by its new tags immediately.',
+        'Paths are relative to the library root (MEMDRIVE_ROOT). Absolute paths are accepted only when they stay inside the root. The root is a hard sandbox: "../" escapes and symlinks pointing outside are rejected.',
+      ].join('\n'),
+      inputSchema: {
+        path: z
+          .string()
+          .min(1)
+          .describe(
+            'Note to edit, relative to the library root (for example "notes/2026-10-28.md").',
+          ),
+        operation: z
+          .enum(['add', 'remove', 'rename'])
+          .describe(
+            'One operation per call: "add" adds tag, "remove" removes tag, "rename" renames tag to new_tag.',
+          ),
+        tag: z
+          .string()
+          .min(1)
+          .describe(
+            'The tag to add, remove, or rename (without the leading "#").',
+          ),
+        new_tag: z
+          .string()
+          .optional()
+          .describe(
+            'Required for "rename": the new tag name. Ignored for "add" and "remove".',
+          ),
+        location: z
+          .enum(['front_matter', 'body'])
+          .optional()
+          .describe(
+            'Which tag syntax to edit: "front_matter" (default, YAML `tags:`) or "body" (`#tag`s in the text).',
+          ),
+      },
+    },
+    (args) =>
+      wrap(() =>
+        handleEditTags(
+          ctx,
+          args.path,
+          args.operation,
+          args.tag,
+          args.new_tag,
+          args.location ?? 'front_matter',
+        ),
+      ),
+  );
+
+  server.registerTool(
+    'archive_file',
+    {
+      description: [
+        'Move a file into the top-level `archive/` folder, preserving its relative path (`notes/foo.md` becomes `archive/notes/foo.md`).',
+        'Archiving is recoverable and is the default way to retire old or superseded files instead of deleting them. Use `restore_file` to move an archived file back.',
+        'Files in `archive/` are excluded from `search_files`, while `list_directory` still shows `archive/` so archived files remain inspectable.',
+        'Refuses to overwrite if the destination under `archive/` already exists, and rejects directories, missing files, `archive/` itself, or files already inside `archive/`.',
+        'Paths are relative to the library root (MEMDRIVE_ROOT). Absolute paths are accepted only when they stay inside the root. The root is a hard sandbox: "../" escapes and symlinks pointing outside are rejected.',
+      ].join('\n'),
+      inputSchema: {
+        path: z
+          .string()
+          .min(1)
+          .describe(
+            'File to archive, relative to the library root (for example "notes/2026-10-28.md").',
+          ),
+      },
+    },
+    (args) => wrap(() => handleArchiveFile(ctx, args.path)),
+  );
+
+  server.registerTool(
+    'restore_file',
+    {
+      description: [
+        'Restore an archived file from the top-level `archive/` folder back to its original path (for example `archive/notes/foo.md` becomes `notes/foo.md`).',
+        'The search index is updated immediately so the restored file is searchable again.',
+        'Refuses to overwrite if a file already exists at the original path, and rejects directories, missing files, or paths not inside `archive/`.',
+        'Paths are relative to the library root (MEMDRIVE_ROOT). Absolute paths are accepted only when they stay inside the root. The root is a hard sandbox: "../" escapes and symlinks pointing outside are rejected.',
+      ].join('\n'),
+      inputSchema: {
+        path: z
+          .string()
+          .min(1)
+          .describe(
+            'Archived file to restore, relative to the library root — must start with "archive/" (for example "archive/notes/2026-10-28.md").',
+          ),
+      },
+    },
+    (args) => wrap(() => handleRestoreFile(ctx, args.path)),
+  );
+
+  server.registerTool(
+    'plan_cleanup',
+    {
+      description: [
+        'Generate a read-only cleanup plan for the library (two-step confirmation). Scans the library and proposes file actions — archiving empty files, duplicate files and orphan attachments — but changes nothing.',
+        'Returns a plan ID and a human-readable preview. The plan is also saved as JSON in the per-library cache dir (plan-<id>.json) for the `apply_plan` tool or the `memdrive-mcp apply <plan-id>` command.',
+        'Empty files, duplicates and orphan attachments are all proposed for archiving (recoverable); nothing is ever permanently deleted. Broken image references are listed as notes, not actions. Similar content is never proposed — only exact SHA-256 duplicates.',
+        'This tool never modifies any file.',
+      ].join('\n'),
+      inputSchema: {},
+    },
+    (_args) => wrap(() => handlePlanCleanup(ctx)),
+  );
+
+  server.registerTool(
+    'apply_plan',
+    {
+      description: [
+        'Execute a cleanup plan created by plan_cleanup, by its plan ID. Archives each action in the plan (empty files, duplicate files, orphan attachments) after re-verifying it; nothing is ever permanently deleted.',
+        'Before executing, each action is re-verified against the library: the path must still exist, the SHA-256 and modification time must match the plan, and the reason must still hold (empty file still empty, duplicate group still intact, orphan still unreferenced). Actions that no longer hold are skipped with the reason, and the rest still execute.',
+        'Plans older than 7 days are rejected. A plan ID that does not exist or is malformed is reported, and nothing is changed. The search index is rebuilt after execution.',
+        'Use this when the user asks to execute a plan in chat (for example "执行这个清理计划"). The command-line `memdrive-mcp apply <plan-id>` does the same thing from a terminal.',
+        'Never call this tool automatically right after plan_cleanup. Always show the user the plan preview and plan ID first and wait for their explicit confirmation in the chat before calling.',
+      ].join('\n'),
+      inputSchema: {
+        plan_id: z
+          .string()
+          .min(1)
+          .describe(
+            'Plan ID returned by plan_cleanup (for example "20261114054412-c4ad79").',
+          ),
+      },
+    },
+    (args) => wrap(() => handleApplyPlan(ctx, args.plan_id)),
   );
 
   server.registerTool(
